@@ -3,12 +3,12 @@
 FreeShot — Screenshot + Annotation Tool for Windows 11
 ═══════════════════════════════════════════════════════
 INSTALL:  pip install pillow pynput pystray pywin32
-HOTKEY:   Alt + Home  (or tray icon)
+HOTKEY:   PrtScrn  or  Alt + Home  (or tray icon)
 """
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog
-import threading, sys, math, time, json, os, gc, ctypes, ctypes.wintypes as _wt
+import threading, sys, math, time, json, os, gc, queue, ctypes, ctypes.wintypes as _wt
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
 import pystray
@@ -16,11 +16,11 @@ from pystray import MenuItem as item
 from pynput import keyboard as kb
 
 # ── Config ────────────────────────────────────────────────────────────────────
-if getattr(sys, "frozen", False):
-    _APP_DIR = os.path.dirname(sys.executable)
-else:
-    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
+# Store config in %APPDATA%\FreeShot\ so it works even when the exe lives in
+# a write-protected location such as C:\Program Files\.
+_CONFIG_PATH = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "FreeShot", "config.json")
 
 class Config:
     def __init__(self):
@@ -40,24 +40,25 @@ class Config:
             self.capture_mode    = d.get("capture_mode", "rect")
             self.auto_save       = bool(d.get("auto_save", True))
             self.save_folder     = d.get("save_folder", "")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[FreeShot] config load: {e}", file=sys.stderr)
 
     def save(self):
         try:
+            os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
             with open(_CONFIG_PATH, "w") as f:
                 json.dump({"auto_copy":       self.auto_copy,
                            "auto_copy_close": self.auto_copy_close,
                            "capture_mode":    self.capture_mode,
                            "auto_save":       self.auto_save,
                            "save_folder":     self.save_folder}, f, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[FreeShot] config save: {e}", file=sys.stderr)
 
 
 # ── Icon ──────────────────────────────────────────────────────────────────────
 def _make_pentagram_icon(size=64):
-    from PIL import ImageFilter
+    # ImageFilter already imported at the top — no duplicate import needed
     S  = size * 4
     cx = cy = S / 2
     pad      = S * 0.06
@@ -92,31 +93,31 @@ def copy_to_clipboard(img: Image.Image) -> bool:
     try:
         import win32clipboard
         win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-
-        if img.mode == "RGBA":
-            # PNG format — preserves transparency in apps that support it
-            png_fmt = win32clipboard.RegisterClipboardFormat("PNG")
-            png_buf = BytesIO()
-            img.save(png_buf, "PNG")
-            win32clipboard.SetClipboardData(png_fmt, png_buf.getvalue())
-
-            # CF_DIB fallback — white background for apps that only read BMP
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            bmp_buf = BytesIO()
-            bg.save(bmp_buf, "BMP")
-            win32clipboard.SetClipboardData(win32clipboard.CF_DIB,
-                                            bmp_buf.getvalue()[14:])
-        else:
-            bmp_buf = BytesIO()
-            img.convert("RGB").save(bmp_buf, "BMP")
-            win32clipboard.SetClipboardData(win32clipboard.CF_DIB,
-                                            bmp_buf.getvalue()[14:])
-
-        win32clipboard.CloseClipboard()
+        try:                                    # ← fix: always close clipboard
+            win32clipboard.EmptyClipboard()
+            if img.mode == "RGBA":
+                # PNG format — preserves transparency in apps that support it
+                png_fmt = win32clipboard.RegisterClipboardFormat("PNG")
+                png_buf = BytesIO()
+                img.save(png_buf, "PNG")
+                win32clipboard.SetClipboardData(png_fmt, png_buf.getvalue())
+                # CF_DIB fallback — white background for apps that only read BMP
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                bmp_buf = BytesIO()
+                bg.save(bmp_buf, "BMP")
+                win32clipboard.SetClipboardData(win32clipboard.CF_DIB,
+                                                bmp_buf.getvalue()[14:])
+            else:
+                bmp_buf = BytesIO()
+                img.convert("RGB").save(bmp_buf, "BMP")
+                win32clipboard.SetClipboardData(win32clipboard.CF_DIB,
+                                                bmp_buf.getvalue()[14:])
+        finally:
+            win32clipboard.CloseClipboard()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[FreeShot] clipboard: {e}", file=sys.stderr)
         return False
 
 
@@ -275,7 +276,6 @@ class SelectionOverlay:
         for w in self.win.winfo_children():
             w.destroy()
         self.win.withdraw()
-        # Release large image objects so GC can reclaim memory
         self.shot = self._dark = self._ph_dark = None
         for attr in ("ann_base", "ann_current", "ann_history",
                      "_ann_dark_patch", "_ann_ph"):
@@ -303,30 +303,28 @@ class SelectionOverlay:
         self.ann_sx = self.ann_sy = 0
         self.ann_pts: list = []
 
-        # Auto-copy the raw selection immediately if enabled
+        # Auto-copy raw selection to clipboard if enabled.
+        # No save_png here — the final save happens in _ann_copy so we don't
+        # produce a duplicate file when auto_copy + auto_save are both on.
         if self.cfg.auto_copy:
             copy_to_clipboard(base)
-            if self.cfg.auto_save:
-                save_png(base, self.cfg.save_folder)
 
-        # Crop the dark background to just the selection area, then free
-        # the full-screen images — saves ~22 MB during annotation
+        # Crop the dark background to just the selection area, then free the
+        # full-screen images — saves ~22 MB during annotation
         self._ann_dark_patch = self._dark.crop(
             (x0, y0, x1, y1)).convert("RGBA")
         self.shot  = None
         self._dark = None
         gc.collect()
 
-        self._ann_region_id = None  # created lazily in _ann_refresh
+        self._ann_region_id = None
 
-        # Unbind selection phase events
         self.cv.unbind("<ButtonPress-1>")
         self.cv.unbind("<B1-Motion>")
         self.cv.unbind("<ButtonRelease-1>")
         self.win.unbind("<r>"); self.win.unbind("<R>")
         self.win.unbind("<f>"); self.win.unbind("<F>")
 
-        # Bind annotation phase events
         self.cv.bind("<ButtonPress-1>",   self._ann_press)
         self.cv.bind("<B1-Motion>",       self._ann_drag)
         self.cv.bind("<ButtonRelease-1>", self._ann_release)
@@ -423,7 +421,6 @@ class SelectionOverlay:
     # ── Tool toggle ───────────────────────────────────────────────────────────
 
     def _ann_toggle_tool(self, t):
-        # Click active tool → deactivate; click other → activate
         if self.ann_tool == t:
             self.ann_tool = None
             self.cv.configure(cursor="arrow")
@@ -445,8 +442,7 @@ class SelectionOverlay:
 
     def _ann_refresh(self, tmp=None):
         img = (tmp or self.ann_current)
-        # Composite annotation onto the pre-cropped dark patch (small, not full-screen)
-        bg = self._ann_dark_patch.copy()
+        bg  = self._ann_dark_patch.copy()
         if img.mode == "RGBA":
             bg.paste(img, (0, 0), img.split()[3])
         else:
@@ -484,14 +480,32 @@ class SelectionOverlay:
         x = e.x - self.ann_x0
         y = e.y - self.ann_y0
         self.ann_pts.append((x, y))
+
         if self.ann_tool in ("arrow", "line", "rect", "blur"):
+            # Shape tools: redraw preview on a temp copy each event
             tmp = self.ann_current.copy()
             self._ann_draw_shape(ImageDraw.Draw(tmp), x, y)
             self._ann_refresh(tmp)
-        elif self.ann_tool in ("pen", "hl", "eraser"):
+        elif self.ann_tool == "hl":
+            # Highlight needs full redraw on tmp so opacity doesn't stack
             tmp = self.ann_current.copy()
             self._ann_draw_stroke(tmp)
             self._ann_refresh(tmp)
+        elif self.ann_tool == "pen":
+            # O(1): draw only the last segment directly on ann_current
+            if len(self.ann_pts) >= 2:
+                ImageDraw.Draw(self.ann_current).line(
+                    self.ann_pts[-2:], fill=self.ann_color,
+                    width=self.ann_thickness, joint="curve")
+            self._ann_refresh()
+        elif self.ann_tool == "eraser":
+            # O(1): erase only at the current point
+            r = max(6, self.ann_thickness * 4)
+            bx0 = max(0, x - r); by0 = max(0, y - r)
+            bx1 = min(self.ann_w, x + r); by1 = min(self.ann_h, y + r)
+            self.ann_current.paste(
+                self.ann_base.crop((bx0, by0, bx1, by1)), (bx0, by0))
+            self._ann_refresh()
 
     def _ann_release(self, e):
         if not self.ann_drawing:
@@ -499,19 +513,33 @@ class SelectionOverlay:
         self.ann_drawing = False
         x = e.x - self.ann_x0
         y = e.y - self.ann_y0
+        changed = True   # assume changed; set False for detected no-ops
+
         if self.ann_tool in ("arrow", "line", "rect"):
             self._ann_draw_shape(ImageDraw.Draw(self.ann_current), x, y)
+            # Zero-length strokes are visual no-ops
+            changed = not (self.ann_sx == x and self.ann_sy == y)
         elif self.ann_tool == "pen":
-            self._ann_draw_stroke(self.ann_current)
+            changed = len(self.ann_pts) >= 2   # drawn incrementally in _ann_drag
         elif self.ann_tool == "hl":
-            self._ann_commit_highlight()
+            if len(self.ann_pts) >= 2:
+                self._ann_commit_highlight()
+            else:
+                changed = False
         elif self.ann_tool == "blur":
-            self._ann_commit_blur(x, y)
+            bx0 = min(self.ann_sx, x); bx1 = max(self.ann_sx, x)
+            by0 = min(self.ann_sy, y); by1 = max(self.ann_sy, y)
+            if bx1 - bx0 >= 2 and by1 - by0 >= 2:
+                self._ann_commit_blur(x, y)
+            else:
+                changed = False
         elif self.ann_tool == "eraser":
-            self._ann_commit_eraser()
-        self.ann_history.append(self.ann_current.copy())
-        if len(self.ann_history) > 10:
-            self.ann_history.pop(0)
+            changed = len(self.ann_pts) >= 2   # drawn incrementally in _ann_drag
+
+        if changed:
+            self.ann_history.append(self.ann_current.copy())
+            if len(self.ann_history) > 10:
+                self.ann_history.pop(0)
         self.ann_pts = []
         self._ann_refresh()
 
@@ -535,6 +563,11 @@ class SelectionOverlay:
             x0, y0 = min(self.ann_sx, cx), min(self.ann_sy, cy)
             x1, y1 = max(self.ann_sx, cx), max(self.ann_sy, cy)
             d.rectangle([x0, y0, x1, y1], outline=c, width=w)
+        elif self.ann_tool == "blur":
+            # Live preview: show the selection area with a highlight outline
+            x0, y0 = min(self.ann_sx, cx), min(self.ann_sy, cy)
+            x1, y1 = max(self.ann_sx, cx), max(self.ann_sy, cy)
+            d.rectangle([x0, y0, x1, y1], outline="#00BFFF", width=2)
 
     def _ann_draw_stroke(self, img: Image.Image):
         if len(self.ann_pts) < 2:
@@ -543,13 +576,10 @@ class SelectionOverlay:
         if self.ann_tool == "pen":
             d.line(self.ann_pts, fill=self.ann_color,
                    width=self.ann_thickness, joint="curve")
-        elif self.ann_tool == "eraser":
-            r = max(6, self.ann_thickness * 4)
-            for px, py in self.ann_pts:
-                bx0 = max(0, px - r); by0 = max(0, py - r)
-                bx1 = min(self.ann_w, px + r)
-                by1 = min(self.ann_h, py + r)
-                img.paste(self.ann_base.crop((bx0, by0, bx1, by1)), (bx0, by0))
+        elif self.ann_tool == "hl":
+            d.line(self.ann_pts,
+                   fill=hex_rgba(self.ann_color, 90),
+                   width=max(14, self.ann_thickness * 7))
 
     def _ann_commit_highlight(self):
         if len(self.ann_pts) < 2:
@@ -570,9 +600,6 @@ class SelectionOverlay:
         patch = self.ann_current.crop((x0, y0, x1, y1))
         self.ann_current.paste(
             patch.filter(ImageFilter.GaussianBlur(radius=10)), (x0, y0))
-
-    def _ann_commit_eraser(self):
-        self._ann_draw_stroke(self.ann_current)
 
     def _ann_place_text(self, x, y):
         dlg = tk.Toplevel(self.win)
@@ -601,6 +628,8 @@ class SelectionOverlay:
                     fnt = None
                 d.text((x, y), txt, fill=self.ann_color, font=fnt)
                 self.ann_history.append(self.ann_current.copy())
+                if len(self.ann_history) > 10:       # ← fix: apply same cap
+                    self.ann_history.pop(0)
                 self._ann_refresh()
             dlg.destroy()
 
@@ -646,18 +675,42 @@ class FreeShotApp:
     _ALT_KEYS = {kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r}
 
     def __init__(self):
+        # Make the process DPI-aware so Tkinter's winfo_screenwidth/height()
+        # returns physical pixels — matching ImageGrab.grab() exactly,
+        # which eliminates the quality-degrading resize on HiDPI displays.
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)  # PER_MONITOR_V2
+        except Exception:
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)      # PER_MONITOR
+            except Exception:
+                pass
+
         self.cfg  = Config()
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.withdraw()
         self._down: set = set()
-        self._active = False
+        self._active    = False
+        self._capture_q = queue.Queue()   # thread-safe PrtScrn signalling
+
         self._setup_tray()
         self._setup_hotkey()
         self._setup_prtscr_hook()
+        # Poll the capture queue every 50 ms — safe alternative to
+        # event_generate() which is not guaranteed across foreign threads
+        self.root.after(50, self._poll_capture_queue)
+
+    def _poll_capture_queue(self):
+        try:
+            while not self._capture_q.empty():
+                self._capture_q.get_nowait()
+                self._trigger()
+        except Exception:
+            pass
+        self.root.after(50, self._poll_capture_queue)
 
     def _setup_tray(self):
-        self._tray_menu_ref = None
         self._rebuild_tray(_make_pentagram_icon(64))
 
     def _rebuild_tray(self, img=None):
@@ -692,11 +745,15 @@ class FreeShotApp:
 
     def _toggle_auto_copy(self, *_):
         self.cfg.auto_copy = not self.cfg.auto_copy
+        if self.cfg.auto_copy:
+            self.cfg.auto_copy_close = False   # mutually exclusive
         self.cfg.save()
         self._rebuild_tray()
 
     def _toggle_auto_copy_close(self, *_):
         self.cfg.auto_copy_close = not self.cfg.auto_copy_close
+        if self.cfg.auto_copy_close:
+            self.cfg.auto_copy = False         # mutually exclusive
         self.cfg.save()
         self._rebuild_tray()
 
@@ -730,10 +787,9 @@ class FreeShotApp:
         l.start()
 
     def _setup_prtscr_hook(self):
-        """Low-level WH_KEYBOARD_LL hook that intercepts Print Screen before
-        Windows Snipping Tool can grab it, then triggers our capture."""
-        self.root.bind("<<Capture>>", lambda _: self._trigger())
-        _root = self.root
+        """Low-level WH_KEYBOARD_LL hook — intercepts PrtScrn before Snipping
+        Tool and signals via a Queue (thread-safe; polled every 50 ms)."""
+        _q = self._capture_q
 
         def _thread():
             try:
@@ -745,8 +801,8 @@ class FreeShotApp:
                 WM_SYSKEYDOWN  = 0x0104
                 VK_SNAPSHOT    = 0x2C
 
-                # c_longlong matches LRESULT (64-bit) on x64 Windows
-                HOOKPROC = ct.WINFUNCTYPE(ct.c_longlong, ct.c_int, wt.WPARAM, wt.LPARAM)
+                HOOKPROC = ct.WINFUNCTYPE(ct.c_longlong, ct.c_int,
+                                          wt.WPARAM, wt.LPARAM)
 
                 @HOOKPROC
                 def _proc(nCode, wParam, lParam):
@@ -754,25 +810,25 @@ class FreeShotApp:
                         vk = ct.c_uint32.from_address(lParam).value
                         if vk == VK_SNAPSHOT:
                             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                                try:
-                                    _root.event_generate("<<Capture>>", when="tail")
-                                except Exception:
-                                    pass
-                            return 1   # suppress all PrtScrn events
-                    return ct.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+                                _q.put(1)   # wake the main-thread poll
+                            return 1        # suppress all PrtScrn events
+                    return ct.windll.user32.CallNextHookEx(
+                        None, nCode, wParam, lParam)
 
-                # Set correct restype — critical on 64-bit Windows
                 u32 = ct.windll.user32
                 u32.SetWindowsHookExW.restype  = ct.c_void_p
-                u32.CallNextHookEx.restype     = ct.c_longlong
+                u32.SetWindowsHookExW.argtypes = [ct.c_int, ct.c_void_p,
+                                                  ct.c_void_p, ct.c_uint]
+                u32.CallNextHookEx.restype      = ct.c_longlong
                 u32.UnhookWindowsHookEx.restype = ct.c_bool
-                u32.GetMessageW.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint, ct.c_uint]
+                u32.GetMessageW.argtypes        = [ct.c_void_p, ct.c_void_p,
+                                                   ct.c_uint, ct.c_uint]
 
                 hhook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, _proc, None, 0)
                 if not hhook:
-                    return   # hook failed (no elevated rights needed, so rare)
+                    return
 
-                self._prtscr_proc  = _proc   # keep alive (GC guard)
+                self._prtscr_proc  = _proc    # GC guard
                 self._prtscr_hhook = hhook
 
                 msg = wt.MSG()
@@ -781,8 +837,8 @@ class FreeShotApp:
                     u32.DispatchMessageW(ct.byref(msg))
 
                 u32.UnhookWindowsHookEx(hhook)
-            except Exception:
-                pass   # hook unavailable; Alt+Home still works
+            except Exception as e:
+                print(f"[FreeShot] hook: {e}", file=sys.stderr)
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -793,6 +849,7 @@ class FreeShotApp:
         if self._active:
             return
         self._active = True
+        self._down.clear()   # clear stale modifier-key state before capture
         self.root.after(400, self._capture)
 
     def _capture(self):
@@ -800,6 +857,7 @@ class FreeShotApp:
         lw = self.root.winfo_screenwidth()
         lh = self.root.winfo_screenheight()
         if shot.size != (lw, lh):
+            # Fallback only — should not be needed after SetProcessDpiAwarenessContext
             shot = shot.resize((lw, lh), Image.LANCZOS)
         SelectionOverlay(self.root, shot, self._on_done, self.cfg)
 
