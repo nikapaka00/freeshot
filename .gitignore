@@ -1,0 +1,22 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Debug / logs
+debug.log
+*.log
+
+# User config (machine-specific)
+config.json
+
+# Backups and temp files
+backup/
+icon_preview.png
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
