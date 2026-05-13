@@ -376,7 +376,13 @@ class SelectionOverlay:
             log("  auto_copy_close: copying and closing immediately")
             copy_to_clipboard(region)
             if self.cfg.auto_save:
-                save_png(region, self.cfg.save_folder)
+                try:
+                    save_png(region, self.cfg.save_folder)
+                    log("  auto_copy_close save: OK")
+                except Exception as e:
+                    log(f"  auto_copy_close save error: {e}")
+                    messagebox.showerror("FreeShot – Save Error",
+                                         f"Auto-save failed:\n{e}")
             self._close_overlay()
             self.done_cb()
             return
