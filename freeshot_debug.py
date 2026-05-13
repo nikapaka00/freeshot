@@ -2,7 +2,7 @@
 """FreeShot — DEBUG BUILD  (logs to %APPDATA%\\FreeShot\\freeshot_debug.log)"""
 
 import tkinter as tk
-from tkinter import colorchooser, filedialog
+from tkinter import colorchooser, filedialog, messagebox
 import threading, sys, math, time, traceback, queue, re, stat, ctypes, ctypes.wintypes as _wt, json, os, gc
 from pathlib import Path
 from io import BytesIO
@@ -41,9 +41,9 @@ log(f"PID {os.getpid()}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # %APPDATA%\FreeShot\ so it works even from write-protected locations
-_CONFIG_PATH = os.path.join(
-    os.environ.get("APPDATA", os.path.expanduser("~")),
-    "FreeShot", "config.json")
+_APP_DIR     = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "FreeShot")
+_CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 log(f"config path = {_CONFIG_PATH}")
 
 class Config:
@@ -769,7 +769,14 @@ class SelectionOverlay:
         log("  ann_copy")
         copy_to_clipboard(self.ann_current)
         if self.cfg.auto_save:
-            save_png(self.ann_current, self.cfg.save_folder)
+            try:
+                save_png(self.ann_current, self.cfg.save_folder)
+            except Exception as e:
+                log(f"  ann_copy: auto-save failed: {e}")
+                messagebox.showerror(
+                    "FreeShot — Save Failed",
+                    f"Could not auto-save screenshot:\n{e}",
+                    parent=self.win)
         self._close_overlay()
         self.done_cb()
 
@@ -794,7 +801,11 @@ class SelectionOverlay:
             img.save(path, fmt)
         except Exception as e:
             log(f"  save error: {e}")
-            return
+            messagebox.showerror(
+                "FreeShot — Save Failed",
+                f"Could not save to:\n{path}\n\n{e}",
+                parent=self.win)
+            return   # keep overlay open so user can try a different path
         log(f"  saved to {path}  fmt={fmt}")
         self._close_overlay()
         self.done_cb()
@@ -1041,8 +1052,9 @@ class FreeShotApp:
                 shot = shot.resize((lw, lh), Image.LANCZOS)
             SelectionOverlay(self.root, shot, self._on_done, self.cfg)
         except Exception:
-            log(f"  _capture EXCEPTION:\n{traceback.format_exc()}")
+            # Always release the lock so subsequent hotkey presses still work
             self._active = False
+            log(f"  _capture EXCEPTION:\n{traceback.format_exc()}")
 
     def _on_done(self):
         log("  _on_capture_done")

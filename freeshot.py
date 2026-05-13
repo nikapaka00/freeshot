@@ -7,7 +7,7 @@ HOTKEY:   PrtScrn  or  Alt + Home  (or tray icon)
 """
 
 import tkinter as tk
-from tkinter import colorchooser, filedialog
+from tkinter import colorchooser, filedialog, messagebox
 import threading, sys, math, time, json, os, gc, queue, re, stat, ctypes, ctypes.wintypes as _wt
 from pathlib import Path
 from io import BytesIO
@@ -19,9 +19,10 @@ from pynput import keyboard as kb
 # ── Config ────────────────────────────────────────────────────────────────────
 # Store config in %APPDATA%\FreeShot\ so it works even when the exe lives in
 # a write-protected location such as C:\Program Files\.
-_CONFIG_PATH = os.path.join(
-    os.environ.get("APPDATA", os.path.expanduser("~")),
-    "FreeShot", "config.json")
+_APP_DIR    = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "FreeShot")
+_CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
+_ERROR_LOG   = os.path.join(_APP_DIR, "error.log")   # fatal crash log (production)
 
 class Config:
     def __init__(self):
@@ -694,7 +695,14 @@ class SelectionOverlay:
     def _ann_copy(self):
         copy_to_clipboard(self.ann_current)
         if self.cfg.auto_save:
-            save_png(self.ann_current, self.cfg.save_folder)
+            try:
+                save_png(self.ann_current, self.cfg.save_folder)
+            except Exception as e:
+                # Tell the user — don't silently discard a failed save
+                messagebox.showerror(
+                    "FreeShot — Save Failed",
+                    f"Could not auto-save screenshot:\n{e}",
+                    parent=self.win)
         self._close_overlay()
         self.done_cb()
 
@@ -718,7 +726,11 @@ class SelectionOverlay:
             img.save(path, fmt)
         except Exception as e:
             print(f"[FreeShot] save error: {e}", file=sys.stderr)
-            return
+            messagebox.showerror(
+                "FreeShot — Save Failed",
+                f"Could not save to:\n{path}\n\n{e}",
+                parent=self.win)
+            return   # keep overlay open so user can try a different path
         self._close_overlay()
         self.done_cb()
 
@@ -763,8 +775,9 @@ class FreeShotApp:
             while not self._capture_q.empty():
                 self._capture_q.get_nowait()
                 self._trigger()
-        except Exception:
-            pass
+        except Exception as e:
+            # Log but never crash — the after() below must always re-arm
+            print(f"[FreeShot] poll_capture_queue: {e}", file=sys.stderr)
         self.root.after(50, self._poll_capture_queue)
 
     def _setup_tray(self):
@@ -917,13 +930,19 @@ class FreeShotApp:
         self.root.after(400, self._capture)
 
     def _capture(self):
-        shot = ImageGrab.grab()
-        lw = self.root.winfo_screenwidth()
-        lh = self.root.winfo_screenheight()
-        if shot.size != (lw, lh):
-            # Fallback only — should not be needed after SetProcessDpiAwarenessContext
-            shot = shot.resize((lw, lh), Image.LANCZOS)
-        SelectionOverlay(self.root, shot, self._on_done, self.cfg)
+        try:
+            shot = ImageGrab.grab()
+            lw = self.root.winfo_screenwidth()
+            lh = self.root.winfo_screenheight()
+            if shot.size != (lw, lh):
+                # Fallback only — should not be needed after SetProcessDpiAwarenessContext
+                shot = shot.resize((lw, lh), Image.LANCZOS)
+            SelectionOverlay(self.root, shot, self._on_done, self.cfg)
+        except Exception as e:
+            # Always release the lock — without this, every subsequent
+            # hotkey press is silently ignored until the app is restarted
+            self._active = False
+            print(f"[FreeShot] capture failed: {e}", file=sys.stderr)
 
     def _on_done(self):
         self._active = False
@@ -939,4 +958,17 @@ class FreeShotApp:
 
 
 if __name__ == "__main__":
-    FreeShotApp().run()
+    import traceback as _tb
+    try:
+        FreeShotApp().run()
+    except Exception:
+        # In --windowed EXE builds stderr is suppressed; write the crash
+        # to %APPDATA%\FreeShot\error.log so it is not silently discarded
+        try:
+            os.makedirs(_APP_DIR, exist_ok=True)
+            with open(_ERROR_LOG, "a", encoding="utf-8") as _f:
+                import datetime as _dt
+                _f.write(f"\n=== {_dt.datetime.now().isoformat()} ===\n")
+                _f.write(_tb.format_exc())
+        except Exception:
+            pass   # last-resort: if we can't even write the log, give up quietly
