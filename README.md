@@ -87,12 +87,74 @@ The built EXE will be in `dist/FreeShot.exe`.
 | `freeshot.ico` | Application icon |
 | `version_info.txt` | Windows EXE version/metadata for PyInstaller |
 | `requirements.txt` | Python dependencies |
+| `nikapaka00-codesign.cer` | Public code-signing certificate (verify EXE authenticity) |
 
 ---
 
 ## Author
 
 **nikapaka00**
+
+---
+
+## Verifying the download
+
+Every release EXE is code-signed and ships with a SHA-256 checksum.
+
+### Check the hash (quickest)
+
+**PowerShell:**
+```powershell
+Get-FileHash FreeShot.exe -Algorithm SHA256
+# Must match the SHA-256 listed on the GitHub Release page
+```
+
+**Command Prompt:**
+```cmd
+certutil -hashfile FreeShot.exe SHA256
+```
+
+### Check the code signature
+
+```powershell
+# Shows publisher, timestamp, and whether the signature is intact
+Get-AuthenticodeSignature FreeShot.exe | Format-List
+
+# Expected output:
+#   SignerCertificate : [thumbprint 8FBFD48680B0F4215A88D865974D3CD498EC728E]
+#   Status            : UnknownError   ← expected: self-signed cert, not CA-issued
+#   StatusMessage     : A certificate chain could not be built...
+#   SignatureType     : Authenticode
+```
+
+> **Note on SmartScreen:** The EXE is signed by a self-signed certificate (publisher: *nikapaka00*).
+> Windows SmartScreen will still warn on first download because the cert is not issued by a
+> commercial CA. To skip the warning, verify the SHA-256 hash matches the release page value,
+> then right-click → Properties → Unblock. The source code is MIT-licensed and public — you
+> can audit or build it yourself at any time.
+
+### Verify against the bundled certificate
+
+The public signing certificate (`nikapaka00-codesign.cer`) is included in the repository.
+To confirm the EXE was signed with it:
+
+```powershell
+$sig  = Get-AuthenticodeSignature "FreeShot.exe"
+$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 "nikapaka00-codesign.cer"
+$sig.SignerCertificate.Thumbprint -eq $cert.Thumbprint   # must return True
+```
+
+### Build it yourself
+
+The cleanest trust model is building from source:
+
+```bash
+git clone https://github.com/nikapaka00/freeshot.git
+cd freeshot
+pip install -r requirements.txt
+pip install pyinstaller
+pyinstaller --onefile --windowed --icon=freeshot.ico --name=FreeShot freeshot.py
+```
 
 ---
 
