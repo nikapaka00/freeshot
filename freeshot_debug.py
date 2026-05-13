@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""FreeShot — DEBUG BUILD  (logs to C:\\Freeshot\\debug.log)"""
+"""FreeShot — DEBUG BUILD  (logs to %APPDATA%\\FreeShot\\freeshot_debug.log)"""
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog
-import threading, sys, math, time, traceback, queue, ctypes, ctypes.wintypes as _wt, json, os, gc
+import threading, sys, math, time, traceback, queue, re, stat, ctypes, ctypes.wintypes as _wt, json, os, gc
+from pathlib import Path
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
 import pystray
@@ -12,9 +13,21 @@ from pynput import keyboard as kb
 
 # ── Logger ────────────────────────────────────────────────────────────────────
 import logging
-LOG = r"C:\Freeshot\debug.log"
+_LOG_DIR  = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "FreeShot")
+_LOG_PATH = os.path.join(_LOG_DIR, "freeshot_debug.log")
+os.makedirs(_LOG_DIR, exist_ok=True)
+# %APPDATA% NTFS ACLs already restrict access to the current user.
+# os.chmod adds belt-and-suspenders on systems that honour Unix modes.
+if not os.path.exists(_LOG_PATH):
+    open(_LOG_PATH, "w").close()
+try:
+    os.chmod(_LOG_PATH, stat.S_IRUSR | stat.S_IWUSR)   # 0o600 — owner read/write only
+except OSError:
+    pass
 logging.basicConfig(
-    filename=LOG, filemode="w", level=logging.DEBUG,
+    filename=_LOG_PATH, filemode="w", level=logging.DEBUG,
     format="%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S"
 )
@@ -50,7 +63,7 @@ class Config:
             self.auto_copy_close = bool(d.get("auto_copy_close", False))
             self.capture_mode    = d.get("capture_mode", "rect")
             self.auto_save       = bool(d.get("auto_save", True))
-            self.save_folder     = d.get("save_folder", "")
+            self.save_folder     = _validate_save_folder(d.get("save_folder", ""))
             log(f"  config loaded  auto_copy={self.auto_copy}  auto_copy_close={self.auto_copy_close}  "
                 f"capture_mode={self.capture_mode}  auto_save={self.auto_save}  "
                 f"save_folder={self.save_folder!r}")
@@ -100,9 +113,15 @@ def _make_pentagram_icon(size=64):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def hex_rgba(h, a=255):
-    h = h.lstrip("#")
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), a)
+_HEX_RE = re.compile(r'^#?([0-9a-fA-F]{6})$')
+
+def hex_rgba(h: str, a: int = 255) -> tuple:
+    """Convert a #RRGGBB hex string to an RGBA tuple. Never raises."""
+    m = _HEX_RE.match(h.strip())
+    if not m:
+        return (255, 0, 0, a)   # fall back to red on bad input
+    c = m.group(1)
+    return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16), a)
 
 def copy_to_clipboard(img: Image.Image) -> bool:
     try:
@@ -136,20 +155,65 @@ def copy_to_clipboard(img: Image.Image) -> bool:
         return False
 
 
+def _validate_save_folder(raw: str) -> str:
+    """Return *raw* if it is a safe local path under the user home dir; empty string otherwise."""
+    if not raw:
+        return ""
+    try:
+        p = Path(raw).resolve()
+    except (ValueError, OSError):
+        return ""
+    s = str(p)
+    # Reject UNC / network paths (\\server\share or //server/share)
+    if s.startswith("\\\\") or raw.lstrip().startswith("//"):
+        return ""
+    # Path must reside under the current user's home directory
+    try:
+        p.relative_to(Path.home().resolve())
+        return s
+    except ValueError:
+        return ""
+
+
+_SAVE_EXTS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
+
+
+def _load_font(size: int):
+    """Return a TrueType font at *size* pts, or None. Tries multiple Windows fonts; never raises."""
+    from PIL import ImageFont
+    candidates = [
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeui.ttf"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "tahoma.ttf"),
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except (IOError, OSError):
+            continue
+    return None
+
+
 def save_png(img: Image.Image, folder: str = "") -> str:
-    """Save *img* as a lossless PNG; returns the saved file path."""
+    """Save *img* as a lossless PNG using atomic exclusive-create; returns the saved path."""
     if not folder:
         folder = os.path.join(os.path.expanduser("~"), "Pictures", "FreeShot")
     os.makedirs(folder, exist_ok=True)
     ts   = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(folder, f"freeshot_{ts}.png")
-    n = 1
-    while os.path.exists(path):
-        path = os.path.join(folder, f"freeshot_{ts}_{n}.png")
-        n += 1
-    img.save(path, "PNG")
-    log(f"  saved PNG → {path}")
-    return path
+    base = os.path.join(folder, f"freeshot_{ts}")
+    n = 0
+    while True:
+        suffix = "" if n == 0 else f"_{n}"
+        path   = f"{base}{suffix}.png"
+        try:
+            with open(path, "xb") as f:   # 'x' = exclusive create — no TOCTOU race
+                img.save(f, "PNG")
+            log(f"  saved PNG → {path}")
+            return path
+        except FileExistsError:
+            n += 1
+            if n > 999:
+                raise RuntimeError("save_png: cannot find a unique filename")
 
 
 # ── Selection + Inline Annotation Overlay ────────────────────────────────────
@@ -680,18 +744,13 @@ class SelectionOverlay:
             txt = e.get().strip()
             if txt:
                 d = ImageDraw.Draw(self.ann_current)
-                try:
-                    from PIL import ImageFont
-                    fnt = ImageFont.truetype(
-                        "C:/Windows/Fonts/segoeui.ttf", fs)
-                except Exception:
-                    fnt = None
+                fnt = _load_font(fs)
                 d.text((x, y), txt, fill=self.ann_color, font=fnt)
                 self.ann_history.append(self.ann_current.copy())
                 if len(self.ann_history) > 10:        # fix: apply cap
                     self.ann_history.pop(0)
                 self._ann_refresh()
-                log(f"  text placed: '{txt}'  history len={len(self.ann_history)}")
+                log(f"  text placed: <{len(txt)} chars>  pos=({x},{y})  history_len={len(self.ann_history)}")
             dlg.destroy()
 
         e.bind("<Return>", commit)
@@ -718,17 +777,27 @@ class SelectionOverlay:
         log("  ann_save dialog")
         path = filedialog.asksaveasfilename(
             parent=self.win, defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("BMP", "*.bmp")],
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg *.jpeg"), ("BMP", "*.bmp")],
             initialfile=f"freeshot_{int(time.time())}.png"
         )
-        if path:
-            img = self.ann_current
-            if path.lower().endswith((".jpg", ".jpeg")) and img.mode == "RGBA":
-                img = img.convert("RGB")
-            img.save(path)
-            log(f"  saved to {path}")
-            self._close_overlay()
-            self.done_cb()
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        fmt = _SAVE_EXTS.get(ext, "PNG")        # explicit format — never inferred
+        if ext not in _SAVE_EXTS:               # user typed unknown extension
+            path += ".png"
+            fmt   = "PNG"
+        img = self.ann_current
+        if fmt == "JPEG" and img.mode == "RGBA":
+            img = img.convert("RGB")
+        try:
+            img.save(path, fmt)
+        except Exception as e:
+            log(f"  save error: {e}")
+            return
+        log(f"  saved to {path}  fmt={fmt}")
+        self._close_overlay()
+        self.done_cb()
 
     def _ann_cancel(self):
         log("  ann_cancel")
@@ -761,7 +830,7 @@ class FreeShotApp:
         self.root.withdraw()
         self._down: set = set()
         self._active    = False
-        self._capture_q = queue.Queue()
+        self._capture_q = queue.Queue(maxsize=1)   # bounded: drop if a capture is already pending
 
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
@@ -897,12 +966,19 @@ class FreeShotApp:
 
                 @HOOKPROC
                 def _proc(nCode, wParam, lParam):
-                    if nCode >= 0:
-                        vk = ct.c_uint32.from_address(lParam).value
+                    if nCode >= 0 and lParam:           # null-pointer guard
+                        try:
+                            vk = ct.c_uint32.from_address(lParam).value
+                        except (ValueError, OSError):   # invalid address — pass through
+                            return ct.windll.user32.CallNextHookEx(
+                                None, nCode, wParam, lParam)
                         if vk == VK_SNAPSHOT:
                             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                                log("  PrtScrn DOWN intercepted → queue.put")
-                                _q.put(1)
+                                log("  PrtScrn DOWN intercepted → queue.put_nowait")
+                                try:
+                                    _q.put_nowait(1)    # drop silently if already full
+                                except queue.Full:
+                                    pass
                             return 1
                     return ct.windll.user32.CallNextHookEx(
                         None, nCode, wParam, lParam)
