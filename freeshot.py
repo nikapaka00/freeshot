@@ -220,6 +220,36 @@ def _set_window_noactivate(hwnd: int, enable: bool) -> None:
         pass
 
 
+def _hand_back_focus(target_hwnd: int) -> None:
+    """Hand keyboard focus back to ``target_hwnd``.
+
+    SetForegroundWindow alone fails when a foreground-lock is in effect
+    (typical right after we steal focus by creating a Tk window). The
+    AttachThreadInput trick lifts that restriction by making our thread
+    look — to the OS — like the same input thread as the target.
+    """
+    if not target_hwnd:
+        return
+    try:
+        u32  = ctypes.windll.user32
+        k32  = ctypes.windll.kernel32
+        if not u32.IsWindow(target_hwnd):
+            return
+        tgt_tid = u32.GetWindowThreadProcessId(target_hwnd, None)
+        our_tid = k32.GetCurrentThreadId()
+        if tgt_tid and tgt_tid != our_tid:
+            u32.AttachThreadInput(our_tid, tgt_tid, True)
+            try:
+                u32.SetForegroundWindow(target_hwnd)
+                u32.SetFocus(target_hwnd)
+            finally:
+                u32.AttachThreadInput(our_tid, tgt_tid, False)
+        else:
+            u32.SetForegroundWindow(target_hwnd)
+    except Exception:
+        pass
+
+
 _SAVE_EXTS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
 _SSAA = 2   # supersampling scale — draw at 2× then downscale for smooth edges
 
@@ -1092,15 +1122,28 @@ class FreeShotApp:
         # keyboard focus (the overlay re-enables activation when shown).
         _set_window_noactivate(self.root.winfo_id(), True)
 
-        # Hand focus back to the user's app — if we stole it during tk.Tk()
-        # the user's typing would otherwise go to our hidden window.
+        # Push the (still-hidden) root to the bottom of the Z-order — this
+        # detaches it from the active-window slot some Windows versions
+        # leave it in even after withdraw().
         try:
-            u32 = ctypes.windll.user32
-            if _prev_fg and u32.IsWindow(_prev_fg) and \
-                    _prev_fg != self.root.winfo_id():
-                u32.SetForegroundWindow(_prev_fg)
+            HWND_BOTTOM        = 1
+            SWP_NOMOVE         = 0x0002
+            SWP_NOSIZE         = 0x0001
+            SWP_NOACTIVATE     = 0x0010
+            ctypes.windll.user32.SetWindowPos(
+                self.root.winfo_id(), HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:
             pass
+
+        # Hand focus back to the user's app. AttachThreadInput is required —
+        # plain SetForegroundWindow fails under the foreground-lock that's
+        # active immediately after tk.Tk() steals focus.
+        if _prev_fg and _prev_fg != self.root.winfo_id():
+            _hand_back_focus(_prev_fg)
+            # Schedule another attempt once the Tk event loop has settled,
+            # in case the first one raced with Tk's own focus management.
+            self.root.after(120, lambda: _hand_back_focus(_prev_fg))
 
         self._active      = False
         self._overlay_ref = None                   # live reference to the open SelectionOverlay
