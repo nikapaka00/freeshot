@@ -498,17 +498,6 @@ class SelectionOverlay:
         log("SelectionOverlay._close_overlay")
         for w in self.win.winfo_children():
             w.destroy()
-        # Return keyboard focus to the app that was foreground before the overlay.
-        # Must happen BEFORE withdraw — we still hold foreground at this point.
-        try:
-            prev = getattr(self, '_prev_fg', 0)
-            if prev and ctypes.windll.user32.IsWindow(prev):
-                ok = ctypes.windll.user32.SetForegroundWindow(prev)
-                log(f"  SetForegroundWindow(_prev_fg={prev:#x}) → {ok}")
-            else:
-                log(f"  _prev_fg={prev:#x} invalid or zero — skipping restore")
-        except Exception as _e:
-            log(f"  focus restore EXCEPTION: {_e}")
         self.win.withdraw()
         self.shot = self._dark = self._ph_dark = None
         for attr in ("ann_base", "ann_current", "ann_history",
@@ -1279,7 +1268,8 @@ class FreeShotApp:
         fs_entry = _FULLSCREEN_KEYS.get(self.cfg.fullscreen_key)
         fs_mod   = fs_entry[0] if fs_entry else None
         fs_vk    = fs_entry[1] if fs_entry else None
-        _app     = self   # reference for overlay key routing
+        _app        = self   # reference for overlay key routing
+        _intercepted = set()  # VKs whose KEYDOWN was swallowed; KEYUP must be swallowed too
         log(f"  _setup_hotkeys  cap_vk={cap_vk:#x}  fs_mod={fs_mod}  fs_vk={fs_vk!r}")
 
         def _thread():
@@ -1363,26 +1353,33 @@ class FreeShotApp:
 
                         # ── Overlay keyboard shortcuts ───────────────────────
                         # Route Escape / R / F to the overlay via the queue.
-                        # This works even if the overlay window doesn't have
-                        # OS keyboard focus (common on Windows 11 tray apps).
-                        if not is_up:
-                            _ov = _app._overlay_ref
-                            if _ov is not None:
-                                if vk == 0x1B:        # VK_ESCAPE — cancel overlay
-                                    log(f"  hook → overlay Escape (vk=0x1b)")
-                                    try:    _q.put_nowait(3)
-                                    except: pass
-                                    return 1
-                                elif vk == 0x52:      # VK_R — rectangle mode
-                                    log(f"  hook → overlay R (rect mode)")
-                                    try:    _q.put_nowait(4)
-                                    except: pass
-                                    return 1
-                                elif vk == 0x46:      # VK_F — freehand mode
-                                    log(f"  hook → overlay F (free mode)")
-                                    try:    _q.put_nowait(5)
-                                    except: pass
-                                    return 1
+                        # Works regardless of OS keyboard focus.
+                        # _intercepted tracks VKs whose KEYDOWN was swallowed so
+                        # their KEYUP is also swallowed — avoids orphaned KEYUP
+                        # events that corrupt other apps' keyboard state.
+                        if is_up and vk in _intercepted:
+                            log(f"  hook swallow KEYUP for intercepted vk={vk:#x}")
+                            _intercepted.discard(vk)
+                            return 1
+                        if not is_up and _app._overlay_ref is not None:
+                            if vk == 0x1B:        # VK_ESCAPE — cancel overlay
+                                log(f"  hook → overlay Escape (vk=0x1b)")
+                                _intercepted.add(vk)
+                                try:    _q.put_nowait(3)
+                                except: pass
+                                return 1
+                            elif vk == 0x52:      # VK_R — rectangle mode
+                                log(f"  hook → overlay R (rect mode)")
+                                _intercepted.add(vk)
+                                try:    _q.put_nowait(4)
+                                except: pass
+                                return 1
+                            elif vk == 0x46:      # VK_F — freehand mode
+                                log(f"  hook → overlay F (free mode)")
+                                _intercepted.add(vk)
+                                try:    _q.put_nowait(5)
+                                except: pass
+                                return 1
 
                     return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
