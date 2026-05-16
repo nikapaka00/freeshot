@@ -242,6 +242,14 @@ _FULLSCREEN_KEYS: dict[str, object] = {
     "F16":                  (None,   0x7F),
 }
 
+# RegisterHotKey modifier flags (Windows SDK)
+_MOD_NOREPEAT = 0x4000          # prevents repeated WM_HOTKEY on key hold
+_FS_MOD_FLAGS = {               # fullscreen-key modifier → MOD_* flag
+    "alt":  0x0001 | 0x4000,    # MOD_ALT  | MOD_NOREPEAT
+    "ctrl": 0x0002 | 0x4000,    # MOD_CTRL | MOD_NOREPEAT
+    None:   0x4000,             # no modifier
+}
+
 
 def _load_font(size: int):
     """Return a TrueType font at *size* pts, or None. Tries multiple Windows fonts; never raises."""
@@ -1117,8 +1125,9 @@ class FreeShotApp:
         except Exception as e:
             log(f"  GetSystemMetrics error: {e}")
 
+        self._hotkey_tid = 0
         self._setup_tray()
-        self._setup_prtscr_hook()
+        self._setup_hotkeys()
         self.root.after(50, self._poll_capture_queue)
         log("FreeShotApp ready — waiting for hotkey")
 
@@ -1203,117 +1212,87 @@ class FreeShotApp:
             self._settings_win.win.focus_force()
             return
         log("  creating SettingsWindow")
-        self._settings_win = SettingsWindow(self.root, self.cfg, self._rebuild_tray)
+        self._settings_win = SettingsWindow(self.root, self.cfg, self._on_settings_change)
 
-    def _setup_prtscr_hook(self):
-        """WH_KEYBOARD_LL hook — signals via Queue (1=selection, 2=fullscreen), polled every 50 ms."""
+    def _setup_hotkeys(self):
+        """Register system-wide hotkeys via RegisterHotKey.
+        Unlike WH_KEYBOARD_LL there is no per-keypress Python callback, so the
+        Python GIL is never held across normal typing — no keyboard freeze.
+        Queue values: 1 = selection capture, 2 = fullscreen capture."""
         _q   = self._capture_q
-        _cfg = self.cfg          # live reference — key changes take effect immediately
+        _cfg = self.cfg
 
         def _thread():
-            log("  hook thread started")
+            log("  hotkey thread started")
             try:
                 import ctypes as ct
                 import ctypes.wintypes as wt
 
-                WH_KEYBOARD_LL = 13
-                WM_KEYDOWN     = 0x0100
-                WM_KEYUP       = 0x0101
-                WM_SYSKEYDOWN  = 0x0104
-                WM_SYSKEYUP    = 0x0105
-                VK_MENU        = 0x12   # Alt
-                VK_CONTROL     = 0x11
+                WM_HOTKEY = 0x0312
+                u32       = ct.windll.user32
+                u32.GetMessageW.argtypes = [ct.c_void_p, ct.c_void_p,
+                                            ct.c_uint, ct.c_uint]
 
-                HOOKPROC = ct.WINFUNCTYPE(ct.c_longlong, ct.c_int, wt.WPARAM, wt.LPARAM)
+                self._hotkey_tid = ct.windll.kernel32.GetCurrentThreadId()
+                log(f"  hotkey thread tid={self._hotkey_tid}")
 
-                u32 = ct.windll.user32
-                u32.SetWindowsHookExW.restype  = ct.c_void_p
-                u32.SetWindowsHookExW.argtypes = [ct.c_int, ct.c_void_p,
-                                                  ct.c_void_p, ct.c_uint]
-                u32.CallNextHookEx.restype      = ct.c_longlong
-                u32.UnhookWindowsHookEx.restype = ct.c_bool
-                u32.GetMessageW.argtypes        = [ct.c_void_p, ct.c_void_p,
-                                                   ct.c_uint, ct.c_uint]
-                u32.GetKeyState.restype         = ct.c_short
+                cap_vk   = _CAPTURE_KEYS.get(_cfg.capture_key, 0x2C)
+                fs_entry = _FULLSCREEN_KEYS.get(_cfg.fullscreen_key)
 
-                @HOOKPROC
-                def _proc(nCode, wParam, lParam):
-                    if nCode >= 0 and lParam:
-                        try:
-                            vk = ct.c_uint32.from_address(lParam).value
-                        except (ValueError, OSError):
-                            return u32.CallNextHookEx(None, nCode, wParam, lParam)
-
-                        cap_vk   = _CAPTURE_KEYS.get(_cfg.capture_key, 0x2C)
-                        fs_entry = _FULLSCREEN_KEYS.get(_cfg.fullscreen_key)
-
-                        # ── Capture key (selection) ───────────────────────────
-                        if vk == cap_vk:
-                            # Always swallow KEYUP/SYSKEYUP — prevents Windows from
-                            # seeing an orphaned key-up and corrupting keyboard state
-                            if wParam in (WM_KEYUP, WM_SYSKEYUP):
-                                return 1
-                            alt_down = bool(u32.GetKeyState(VK_MENU) & 0x8000)
-                            # Fire on plain KEYDOWN; also catch SYSKEYDOWN without Alt
-                            # (PrtScrn sometimes arrives as SYSKEYDOWN on certain builds)
-                            if wParam == WM_KEYDOWN or (
-                                    wParam == WM_SYSKEYDOWN and not alt_down):
-                                log(f"  capture key DOWN ({_cfg.capture_key}) → queue 1")
-                                try:
-                                    _q.put_nowait(1)
-                                except queue.Full:
-                                    pass
-                                return 1
-                            # SYSKEYDOWN with Alt held → fall through to fullscreen check
-
-                        # ── Fullscreen key ────────────────────────────────────
-                        if fs_entry is not None:
-                            fs_mod, fs_vk = fs_entry
-                            if vk == fs_vk:
-                                # Swallow KEYUP/SYSKEYUP for fullscreen VK too
-                                if wParam in (WM_KEYUP, WM_SYSKEYUP):
-                                    return 1
-                                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                                    alt_down  = bool(u32.GetKeyState(VK_MENU)    & 0x8000)
-                                    ctrl_down = bool(u32.GetKeyState(VK_CONTROL) & 0x8000)
-                                    if fs_mod == "alt":
-                                        match = wParam == WM_SYSKEYDOWN and alt_down
-                                    elif fs_mod == "ctrl":
-                                        match = wParam == WM_KEYDOWN and ctrl_down
-                                    else:   # no modifier (e.g. F15)
-                                        match = wParam == WM_KEYDOWN
-                                    if match:
-                                        log(f"  fullscreen key DOWN ({_cfg.fullscreen_key}) → queue 2")
-                                        try:
-                                            _q.put_nowait(2)
-                                        except queue.Full:
-                                            pass
-                                        return 1
-
-                    return u32.CallNextHookEx(None, nCode, wParam, lParam)
-
-                hhook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, _proc, None, 0)
-                if not hhook:
+                registered = []
+                if u32.RegisterHotKey(None, 1, _MOD_NOREPEAT, cap_vk):
+                    registered.append(1)
+                    log(f"  RegisterHotKey(capture) OK  vk={cap_vk:#x}")
+                else:
                     err = ct.windll.kernel32.GetLastError()
-                    log(f"  SetWindowsHookExW FAILED  GetLastError={err}")
-                    return
+                    log(f"  RegisterHotKey(capture) FAILED  err={err}")
 
-                self._hook_proc  = _proc
-                self._hook_hhook = hhook
-                log(f"  hook installed  hhook={hhook}")
+                if fs_entry is not None:
+                    fs_mod, fs_vk = fs_entry
+                    mod = _FS_MOD_FLAGS.get(fs_mod, _MOD_NOREPEAT)
+                    if u32.RegisterHotKey(None, 2, mod, fs_vk):
+                        registered.append(2)
+                        log(f"  RegisterHotKey(fullscreen) OK  vk={fs_vk:#x}  mod={mod:#x}")
+                    else:
+                        err = ct.windll.kernel32.GetLastError()
+                        log(f"  RegisterHotKey(fullscreen) FAILED  err={err}")
 
                 msg = wt.MSG()
-                while u32.GetMessageW(ct.byref(msg), None, 0, 0) > 0:
-                    u32.TranslateMessage(ct.byref(msg))
-                    u32.DispatchMessageW(ct.byref(msg))
+                while u32.GetMessageW(ct.byref(msg), None, 0, 0) != 0:
+                    if msg.message == WM_HOTKEY:
+                        log(f"  WM_HOTKEY id={msg.wParam}")
+                        try:
+                            if msg.wParam == 1:
+                                _q.put_nowait(1)
+                            elif msg.wParam == 2:
+                                _q.put_nowait(2)
+                        except queue.Full:
+                            log("  queue full — capture already pending")
 
-                u32.UnhookWindowsHookEx(hhook)
-                log("  hook thread exiting")
+                for hid in registered:
+                    u32.UnregisterHotKey(None, hid)
+                log("  hotkey thread exiting")
             except Exception:
-                log(f"  hook thread EXCEPTION:\n{traceback.format_exc()}")
+                log(f"  hotkey thread EXCEPTION:\n{traceback.format_exc()}")
+            finally:
+                self._hotkey_tid = 0
 
         threading.Thread(target=_thread, daemon=True).start()
-        log("  hook thread spawned")
+        log("  hotkey thread spawned")
+
+    def _update_hotkeys(self):
+        """Stop the current hotkey thread and restart with updated key config."""
+        tid = getattr(self, '_hotkey_tid', 0)
+        log(f"  _update_hotkeys  old_tid={tid}")
+        if tid:
+            ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)  # WM_QUIT
+        self.root.after(150, self._setup_hotkeys)
+
+    def _on_settings_change(self, img=None):
+        """Tray rebuild + hotkey re-registration, called on any settings save."""
+        log("  _on_settings_change")
+        self._rebuild_tray(img)
+        self._update_hotkeys()
 
     def _tray_trigger(self, icon=None, item=None):
         log("  tray_trigger")
