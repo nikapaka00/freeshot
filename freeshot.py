@@ -8,7 +8,7 @@ HOTKEY:   PrtScrn  or  Alt + Home  (or tray icon)
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
-import threading, sys, math, time, json, os, gc, queue, re, stat, ctypes, ctypes.wintypes as _wt
+import threading, sys, math, time, json, os, gc, queue, re, stat, ctypes, ctypes.wintypes as _wt, winreg
 from pathlib import Path
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
@@ -147,6 +147,46 @@ def _validate_save_folder(raw: str) -> str:
         return s
     except ValueError:
         return ""
+
+
+# ── Windows startup registry helpers ─────────────────────────────────────────
+_RUN_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_NAME = "FreeShot"
+
+
+def _get_exe_path() -> str:
+    """Path to register: sys.executable when frozen (PyInstaller), else abspath(argv[0])."""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(sys.argv[0])
+
+
+def _read_startup() -> bool:
+    """Return True if the HKCU Run key exists and points to the current EXE."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, _RUN_NAME)
+            return val == _get_exe_path()
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _write_startup(enable: bool) -> bool:
+    """Add or remove the FreeShot Run entry.  Returns True on success."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY,
+                            access=winreg.KEY_SET_VALUE) as k:
+            if enable:
+                winreg.SetValueEx(k, _RUN_NAME, 0, winreg.REG_SZ, _get_exe_path())
+            else:
+                try:
+                    winreg.DeleteValue(k, _RUN_NAME)
+                except FileNotFoundError:
+                    pass   # already absent — not an error
+        return True
+    except OSError as e:
+        print(f"[FreeShot] registry write failed: {e}", file=sys.stderr)
+        return False
 
 
 _SAVE_EXTS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
@@ -743,6 +783,141 @@ class SelectionOverlay:
         self.done_cb()
 
 
+# ── Settings window ───────────────────────────────────────────────────────────
+class SettingsWindow:
+    """Non-modal settings dialog.  All changes apply immediately."""
+
+    def __init__(self, parent: tk.Tk, cfg, on_change):
+        self.cfg       = cfg
+        self.on_change = on_change
+
+        win = tk.Toplevel(parent)
+        win.title("FreeShot Settings")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = 380, 320
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        self.win = win
+
+        pad = {"padx": 16, "pady": 4}
+
+        # ── Capture behaviour ────────────────────────────────────────────────
+        tk.Label(win, text="Capture behaviour",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
+
+        self._var_ac  = tk.BooleanVar(value=cfg.auto_copy)
+        self._var_acc = tk.BooleanVar(value=cfg.auto_copy_close)
+        self._var_as  = tk.BooleanVar(value=cfg.auto_save)
+
+        tk.Checkbutton(win, text="Auto-copy on capture",
+                       variable=self._var_ac,
+                       command=self._toggle_auto_copy).pack(anchor="w", **pad)
+        tk.Checkbutton(win, text="Auto copy & close",
+                       variable=self._var_acc,
+                       command=self._toggle_auto_copy_close).pack(anchor="w", **pad)
+        tk.Checkbutton(win, text="Auto-save PNG",
+                       variable=self._var_as,
+                       command=self._toggle_auto_save).pack(anchor="w", **pad)
+
+        # ── Capture mode ─────────────────────────────────────────────────────
+        tk.Label(win, text="Capture mode",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16, pady=(10, 2))
+
+        self._var_mode = tk.StringVar(value=cfg.capture_mode)
+        mf = tk.Frame(win)
+        mf.pack(anchor="w", padx=16)
+        tk.Radiobutton(mf, text="Rectangle", variable=self._var_mode, value="rect",
+                       command=self._change_mode).pack(side="left", padx=(0, 16))
+        tk.Radiobutton(mf, text="Freehand",  variable=self._var_mode, value="free",
+                       command=self._change_mode).pack(side="left")
+
+        # ── Save folder ───────────────────────────────────────────────────────
+        tk.Label(win, text="Save folder",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16, pady=(10, 2))
+
+        ff = tk.Frame(win)
+        ff.pack(fill="x", padx=16, pady=(0, 4))
+        self._var_folder = tk.StringVar(
+            value=cfg.save_folder or os.path.join(
+                os.path.expanduser("~"), "Pictures", "FreeShot"))
+        tk.Entry(ff, textvariable=self._var_folder,
+                 state="readonly", width=32).pack(side="left", fill="x", expand=True)
+        tk.Button(ff, text="Browse…",
+                  command=self._pick_folder).pack(side="left", padx=(6, 0))
+
+        # ── System ────────────────────────────────────────────────────────────
+        tk.Label(win, text="System",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16, pady=(10, 2))
+
+        self._var_startup = tk.BooleanVar(value=_read_startup())
+        tk.Checkbutton(win, text="Start with Windows",
+                       variable=self._var_startup,
+                       command=self._toggle_startup).pack(anchor="w", **pad)
+
+        # ── Close ─────────────────────────────────────────────────────────────
+        tk.Button(win, text="Close", command=win.destroy,
+                  width=10).pack(pady=(12, 14))
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+
+    def _toggle_auto_copy(self):
+        self.cfg.auto_copy = self._var_ac.get()
+        if self.cfg.auto_copy:
+            self.cfg.auto_copy_close = False
+            self._var_acc.set(False)
+        self.cfg.save()
+        self.on_change()
+
+    def _toggle_auto_copy_close(self):
+        self.cfg.auto_copy_close = self._var_acc.get()
+        if self.cfg.auto_copy_close:
+            self.cfg.auto_copy = False
+            self._var_ac.set(False)
+        self.cfg.save()
+        self.on_change()
+
+    def _toggle_auto_save(self):
+        self.cfg.auto_save = self._var_as.get()
+        self.cfg.save()
+        self.on_change()
+
+    def _change_mode(self):
+        self.cfg.capture_mode = self._var_mode.get()
+        self.cfg.save()
+        self.on_change()
+
+    def _pick_folder(self):
+        init = self.cfg.save_folder or os.path.join(os.path.expanduser("~"), "Pictures")
+        folder = filedialog.askdirectory(
+            title="FreeShot — choose save folder", initialdir=init, parent=self.win)
+        if folder:
+            validated = _validate_save_folder(folder)
+            if not validated:
+                messagebox.showerror(
+                    "FreeShot — Invalid Folder",
+                    "Please choose a folder inside your home directory.\n"
+                    "Network and system paths are not supported.",
+                    parent=self.win)
+                return
+            self.cfg.save_folder = validated
+            self._var_folder.set(validated)
+            self.cfg.save()
+            self.on_change()
+
+    def _toggle_startup(self):
+        desired = self._var_startup.get()
+        if not _write_startup(desired):
+            self._var_startup.set(not desired)   # revert on failure
+            messagebox.showerror(
+                "FreeShot — Registry Error",
+                "Could not update the Windows startup entry.\n"
+                "Try running FreeShot as administrator once to set this option.",
+                parent=self.win)
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 class FreeShotApp:
     _ALT_KEYS = {kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r}
@@ -809,6 +984,7 @@ class FreeShotApp:
             item(lbl_as,  self._toggle_auto_save),
             item(f"📁  {folder}", self._pick_save_folder),
             pystray.Menu.SEPARATOR,
+            item("⚙  Settings…", self._open_settings),
             item("Exit", self._quit)
         )
         if hasattr(self, "_icon"):
@@ -848,6 +1024,16 @@ class FreeShotApp:
             self.cfg.save_folder = folder
             self.cfg.save()
             self._rebuild_tray()
+
+    def _open_settings(self, *_):
+        self.root.after(0, self._do_open_settings)
+
+    def _do_open_settings(self):
+        if hasattr(self, "_settings_win") and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            self._settings_win.focus_force()
+            return
+        self._settings_win = SettingsWindow(self.root, self.cfg, self._rebuild_tray)
 
     def _setup_hotkey(self):
         def on_press(key):
