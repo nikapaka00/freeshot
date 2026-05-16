@@ -7,14 +7,14 @@ HOTKEY:   PrtScrn  or  Alt + Home  (or tray icon)
 """
 
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox, ttk
 import threading, sys, math, time, json, os, gc, queue, re, stat, ctypes, ctypes.wintypes as _wt, winreg
 from pathlib import Path
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
 import pystray
 from pystray import MenuItem as item
-from pynput import keyboard as kb
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Store config in %APPDATA%\FreeShot\ so it works even when the exe lives in
@@ -28,9 +28,11 @@ class Config:
     def __init__(self):
         self.auto_copy        = False
         self.auto_copy_close  = False
-        self.capture_mode     = "rect"  # "rect" or "free"
+        self.capture_mode     = "rect"             # "rect" or "free"
         self.auto_save        = True
-        self.save_folder      = ""      # empty = ~/Pictures/FreeShot
+        self.save_folder      = ""                 # empty = ~/Pictures/FreeShot
+        self.capture_key      = "Print Screen"     # key name from _CAPTURE_KEYS
+        self.fullscreen_key   = "Alt + Print Screen"  # key name from _FULLSCREEN_KEYS
         self._load()
 
     def _load(self):
@@ -42,6 +44,10 @@ class Config:
             self.capture_mode    = d.get("capture_mode", "rect")
             self.auto_save       = bool(d.get("auto_save", True))
             self.save_folder     = _validate_save_folder(d.get("save_folder", ""))
+            ck = str(d.get("capture_key",    self.capture_key))
+            fk = str(d.get("fullscreen_key", self.fullscreen_key))
+            self.capture_key    = ck if ck in _CAPTURE_KEYS   else "Print Screen"
+            self.fullscreen_key = fk if fk in _FULLSCREEN_KEYS else "Alt + Print Screen"
         except Exception as e:
             print(f"[FreeShot] config load: {e}", file=sys.stderr)
 
@@ -53,7 +59,9 @@ class Config:
                            "auto_copy_close": self.auto_copy_close,
                            "capture_mode":    self.capture_mode,
                            "auto_save":       self.auto_save,
-                           "save_folder":     self.save_folder}, f, indent=2)
+                           "save_folder":     self.save_folder,
+                           "capture_key":     self.capture_key,
+                           "fullscreen_key":  self.fullscreen_key}, f, indent=2)
         except Exception as e:
             print(f"[FreeShot] config save: {e}", file=sys.stderr)
 
@@ -191,6 +199,26 @@ def _write_startup(enable: bool) -> bool:
 
 _SAVE_EXTS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
 _SSAA = 2   # supersampling scale — draw at 2× then downscale for smooth edges
+
+# Supported hotkeys for selection-capture (plain key, no modifier required)
+_CAPTURE_KEYS: dict[str, int] = {
+    "Print Screen":  0x2C,
+    "Scroll Lock":   0x91,
+    "Pause":         0x13,
+    "F13":           0x7C,
+    "F14":           0x7D,
+}
+# Supported hotkeys for fullscreen-capture.
+# Value: (modifier, vk) or None to disable.
+# modifier is "alt", "ctrl", or None (no modifier).
+_FULLSCREEN_KEYS: dict[str, object] = {
+    "None":                 None,
+    "Alt + Print Screen":   ("alt",  0x2C),
+    "Alt + Scroll Lock":    ("alt",  0x91),
+    "Ctrl + Print Screen":  ("ctrl", 0x2C),
+    "F15":                  (None,   0x7E),
+    "F16":                  (None,   0x7F),
+}
 
 
 def _load_font(size: int):
@@ -814,7 +842,7 @@ class SettingsWindow:
         win.attributes("-topmost", True)
         win.update_idletasks()
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        w, h = 380, 320
+        w, h = 380, 400
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
         self.win = win
 
@@ -864,6 +892,29 @@ class SettingsWindow:
         tk.Button(ff, text="Browse…",
                   command=self._pick_folder).pack(side="left", padx=(6, 0))
 
+        # ── Hotkeys ───────────────────────────────────────────────────────────
+        tk.Label(win, text="Hotkeys",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16, pady=(10, 2))
+
+        hf = tk.Frame(win)
+        hf.pack(fill="x", padx=16, pady=(0, 4))
+
+        tk.Label(hf, text="Capture:").grid(row=0, column=0, sticky="w", pady=2)
+        self._var_cap_key = tk.StringVar(value=cfg.capture_key)
+        cap_cb = ttk.Combobox(hf, textvariable=self._var_cap_key,
+                              values=list(_CAPTURE_KEYS.keys()),
+                              state="readonly", width=20)
+        cap_cb.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=2)
+        cap_cb.bind("<<ComboboxSelected>>", lambda _: self._change_capture_key())
+
+        tk.Label(hf, text="Fullscreen:").grid(row=1, column=0, sticky="w", pady=2)
+        self._var_fs_key = tk.StringVar(value=cfg.fullscreen_key)
+        fs_cb = ttk.Combobox(hf, textvariable=self._var_fs_key,
+                             values=list(_FULLSCREEN_KEYS.keys()),
+                             state="readonly", width=20)
+        fs_cb.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=2)
+        fs_cb.bind("<<ComboboxSelected>>", lambda _: self._change_fullscreen_key())
+
         # ── System ────────────────────────────────────────────────────────────
         tk.Label(win, text="System",
                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16, pady=(10, 2))
@@ -901,6 +952,15 @@ class SettingsWindow:
         self.cfg.save()
         self.on_change()
 
+    def _change_capture_key(self):
+        self.cfg.capture_key = self._var_cap_key.get()
+        self.cfg.save()
+        self.on_change()   # rebuilds tray label
+
+    def _change_fullscreen_key(self):
+        self.cfg.fullscreen_key = self._var_fs_key.get()
+        self.cfg.save()
+
     def _change_mode(self):
         self.cfg.capture_mode = self._var_mode.get()
         self.cfg.save()
@@ -937,7 +997,6 @@ class SettingsWindow:
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 class FreeShotApp:
-    _ALT_KEYS = {kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r}
 
     def __init__(self):
         # Make the process DPI-aware so Tkinter's winfo_screenwidth/height()
@@ -955,12 +1014,10 @@ class FreeShotApp:
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.withdraw()
-        self._down: set = set()
         self._active    = False
         self._capture_q = queue.Queue(maxsize=1)   # bounded: drop if a capture is already pending
 
         self._setup_tray()
-        self._setup_hotkey()
         self._setup_prtscr_hook()
         # Poll the capture queue every 50 ms — safe alternative to
         # event_generate() which is not guaranteed across foreign threads
@@ -969,8 +1026,11 @@ class FreeShotApp:
     def _poll_capture_queue(self):
         try:
             while not self._capture_q.empty():
-                self._capture_q.get_nowait()
-                self._trigger()
+                val = self._capture_q.get_nowait()
+                if val == 2:
+                    self._trigger_fullscreen()
+                else:
+                    self._trigger()
         except Exception as e:
             # Log but never crash — the after() below must always re-arm
             print(f"[FreeShot] poll_capture_queue: {e}", file=sys.stderr)
@@ -983,7 +1043,7 @@ class FreeShotApp:
         if img is None:
             img = self._icon.icon
         menu = pystray.Menu(
-            item("📷  Capture  (PrtScrn / Alt+Home)", self._tray_trigger, default=True),
+            item(f"📷  Capture  ({self.cfg.capture_key})", self._tray_trigger, default=True),
             pystray.Menu.SEPARATOR,
             item("⚙  Settings…", self._open_settings),
             item("Exit", self._quit)
@@ -1036,21 +1096,12 @@ class FreeShotApp:
             return
         self._settings_win = SettingsWindow(self.root, self.cfg, self._rebuild_tray)
 
-    def _setup_hotkey(self):
-        def on_press(key):
-            self._down.add(key)
-            if self._down & self._ALT_KEYS and kb.Key.home in self._down:
-                self.root.after(0, self._trigger)
-        def on_release(key):
-            self._down.discard(key)
-        l = kb.Listener(on_press=on_press, on_release=on_release)
-        l.daemon = True
-        l.start()
-
     def _setup_prtscr_hook(self):
-        """Low-level WH_KEYBOARD_LL hook — intercepts PrtScrn before Snipping
-        Tool and signals via a Queue (thread-safe; polled every 50 ms)."""
-        _q = self._capture_q
+        """Low-level WH_KEYBOARD_LL hook — intercepts configured hotkeys and
+        signals via a Queue (thread-safe; polled every 50 ms).
+        Queue values: 1 = selection capture, 2 = fullscreen capture."""
+        _q   = self._capture_q
+        _cfg = self.cfg   # live reference — hook reads current config on each press
 
         def _thread():
             try:
@@ -1060,7 +1111,7 @@ class FreeShotApp:
                 WH_KEYBOARD_LL = 13
                 WM_KEYDOWN     = 0x0100
                 WM_SYSKEYDOWN  = 0x0104
-                VK_SNAPSHOT    = 0x2C
+                VK_CONTROL     = 0x11
 
                 HOOKPROC = ct.WINFUNCTYPE(ct.c_longlong, ct.c_int,
                                           wt.WPARAM, wt.LPARAM)
@@ -1073,13 +1124,36 @@ class FreeShotApp:
                         except (ValueError, OSError):   # invalid address — pass through
                             return ct.windll.user32.CallNextHookEx(
                                 None, nCode, wParam, lParam)
-                        if vk == VK_SNAPSHOT:
-                            if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                                try:
-                                    _q.put_nowait(1)    # drop silently if already full
-                                except queue.Full:
-                                    pass
-                            return 1                    # suppress all PrtScrn events
+
+                        # ── Selection-capture key (plain keypress, no modifier) ──
+                        cap_vk = _CAPTURE_KEYS.get(_cfg.capture_key, 0x2C)
+                        if vk == cap_vk and wParam == WM_KEYDOWN:
+                            try:
+                                _q.put_nowait(1)
+                            except queue.Full:
+                                pass
+                            return 1        # suppress
+
+                        # ── Fullscreen-capture key ───────────────────────────────
+                        fs_entry = _FULLSCREEN_KEYS.get(_cfg.fullscreen_key)
+                        if fs_entry is not None:
+                            fs_mod, fs_vk = fs_entry
+                            if vk == fs_vk:
+                                if fs_mod == "alt":
+                                    match = (wParam == WM_SYSKEYDOWN)
+                                elif fs_mod == "ctrl":
+                                    match = (wParam == WM_KEYDOWN and
+                                             bool(ct.windll.user32.GetKeyState(
+                                                 VK_CONTROL) & 0x8000))
+                                else:       # no modifier
+                                    match = (wParam == WM_KEYDOWN)
+                                if match:
+                                    try:
+                                        _q.put_nowait(2)
+                                    except queue.Full:
+                                        pass
+                                    return 1    # suppress
+
                     return ct.windll.user32.CallNextHookEx(
                         None, nCode, wParam, lParam)
 
@@ -1091,6 +1165,7 @@ class FreeShotApp:
                 u32.UnhookWindowsHookEx.restype = ct.c_bool
                 u32.GetMessageW.argtypes        = [ct.c_void_p, ct.c_void_p,
                                                    ct.c_uint, ct.c_uint]
+                u32.GetKeyState.restype         = ct.c_short
 
                 hhook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, _proc, None, 0)
                 if not hhook:
@@ -1117,7 +1192,6 @@ class FreeShotApp:
         if self._active:
             return
         self._active = True
-        self._down.clear()   # clear stale modifier-key state before capture
         self.root.after(400, self._capture)
 
     def _capture(self):
@@ -1134,6 +1208,30 @@ class FreeShotApp:
             # hotkey press is silently ignored until the app is restarted
             self._active = False
             print(f"[FreeShot] capture failed: {e}", file=sys.stderr)
+
+    def _trigger_fullscreen(self):
+        if self._active:
+            return
+        self._active = True
+        self.root.after(200, self._capture_fullscreen)
+
+    def _capture_fullscreen(self):
+        try:
+            shot = ImageGrab.grab()
+            lw = self.root.winfo_screenwidth()
+            lh = self.root.winfo_screenheight()
+            if shot.size != (lw, lh):
+                shot = shot.resize((lw, lh), Image.LANCZOS)
+            copy_to_clipboard(shot)
+            if self.cfg.auto_save:
+                try:
+                    save_png(shot, self.cfg.save_folder)
+                except Exception as e:
+                    print(f"[FreeShot] fullscreen save error: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[FreeShot] fullscreen capture failed: {e}", file=sys.stderr)
+        finally:
+            self._active = False
 
     def _on_done(self):
         self._active = False
