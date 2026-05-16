@@ -1070,31 +1070,15 @@ class FreeShotApp:
     def _rebuild_tray(self, img=None):
         if img is None:
             img = self._icon.icon
-        lbl_ac  = ("✔  Auto-copy on capture"
-                   if self.cfg.auto_copy else
-                   "    Auto-copy on capture")
-        lbl_acc = ("✔  Auto copy & close"
-                   if self.cfg.auto_copy_close else
-                   "    Auto copy & close")
-        lbl_as  = ("✔  Auto-save PNG"
-                   if self.cfg.auto_save else
-                   "    Auto-save PNG")
-        folder  = self.cfg.save_folder or os.path.join(
-                      os.path.expanduser("~"), "Pictures", "FreeShot")
         menu = pystray.Menu(
             item("📷  Capture  (PrtScrn / Alt+Home)", self._tray_trigger, default=True),
-            pystray.Menu.SEPARATOR,
-            item(lbl_ac,  self._toggle_auto_copy),
-            item(lbl_acc, self._toggle_auto_copy_close),
-            item(lbl_as,  self._toggle_auto_save),
-            item(f"📁  {folder}", self._pick_save_folder),
             pystray.Menu.SEPARATOR,
             item("⚙  Settings…", self._open_settings),
             item("Exit", self._quit)
         )
         if hasattr(self, "_icon"):
             self._icon.menu = menu
-            log(f"  tray menu rebuilt  auto_copy={self.cfg.auto_copy}")
+            log("  tray menu rebuilt")
         else:
             self._icon = pystray.Icon("FreeShot", img, "FreeShot", menu)
             threading.Thread(target=self._icon.run, daemon=True).start()
@@ -1141,10 +1125,10 @@ class FreeShotApp:
         self.root.after(0, self._do_open_settings)
 
     def _do_open_settings(self):
-        if hasattr(self, "_settings_win") and self._settings_win.winfo_exists():
+        if hasattr(self, "_settings_win") and self._settings_win.win.winfo_exists():
             log("  settings window already open — focusing")
-            self._settings_win.lift()
-            self._settings_win.focus_force()
+            self._settings_win.win.lift()
+            self._settings_win.win.focus_force()
             return
         log("  creating SettingsWindow")
         self._settings_win = SettingsWindow(self.root, self.cfg, self._rebuild_tray)
