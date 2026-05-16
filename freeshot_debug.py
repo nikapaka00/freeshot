@@ -1218,7 +1218,10 @@ class FreeShotApp:
 
                 WH_KEYBOARD_LL = 13
                 WM_KEYDOWN     = 0x0100
+                WM_KEYUP       = 0x0101
                 WM_SYSKEYDOWN  = 0x0104
+                WM_SYSKEYUP    = 0x0105
+                VK_MENU        = 0x12   # Alt
                 VK_CONTROL     = 0x11
 
                 HOOKPROC = ct.WINFUNCTYPE(ct.c_longlong, ct.c_int, wt.WPARAM, wt.LPARAM)
@@ -1241,35 +1244,51 @@ class FreeShotApp:
                         except (ValueError, OSError):
                             return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
+                        cap_vk   = _CAPTURE_KEYS.get(_cfg.capture_key, 0x2C)
+                        fs_entry = _FULLSCREEN_KEYS.get(_cfg.fullscreen_key)
+
                         # ── Capture key (selection) ───────────────────────────
-                        cap_vk = _CAPTURE_KEYS.get(_cfg.capture_key, 0x2C)
-                        if vk == cap_vk and wParam == WM_KEYDOWN:
-                            log(f"  capture key DOWN ({_cfg.capture_key}) → queue 1")
-                            try:
-                                _q.put_nowait(1)
-                            except queue.Full:
-                                pass
-                            return 1
+                        if vk == cap_vk:
+                            # Always swallow KEYUP/SYSKEYUP — prevents Windows from
+                            # seeing an orphaned key-up and corrupting keyboard state
+                            if wParam in (WM_KEYUP, WM_SYSKEYUP):
+                                return 1
+                            alt_down = bool(u32.GetKeyState(VK_MENU) & 0x8000)
+                            # Fire on plain KEYDOWN; also catch SYSKEYDOWN without Alt
+                            # (PrtScrn sometimes arrives as SYSKEYDOWN on certain builds)
+                            if wParam == WM_KEYDOWN or (
+                                    wParam == WM_SYSKEYDOWN and not alt_down):
+                                log(f"  capture key DOWN ({_cfg.capture_key}) → queue 1")
+                                try:
+                                    _q.put_nowait(1)
+                                except queue.Full:
+                                    pass
+                                return 1
+                            # SYSKEYDOWN with Alt held → fall through to fullscreen check
 
                         # ── Fullscreen key ────────────────────────────────────
-                        fs_entry = _FULLSCREEN_KEYS.get(_cfg.fullscreen_key)
                         if fs_entry is not None:
                             fs_mod, fs_vk = fs_entry
                             if vk == fs_vk:
-                                if fs_mod == "alt":
-                                    match = (wParam == WM_SYSKEYDOWN)
-                                elif fs_mod == "ctrl":
-                                    match = (wParam == WM_KEYDOWN and
-                                             bool(u32.GetKeyState(VK_CONTROL) & 0x8000))
-                                else:
-                                    match = (wParam == WM_KEYDOWN)
-                                if match:
-                                    log(f"  fullscreen key DOWN ({_cfg.fullscreen_key}) → queue 2")
-                                    try:
-                                        _q.put_nowait(2)
-                                    except queue.Full:
-                                        pass
+                                # Swallow KEYUP/SYSKEYUP for fullscreen VK too
+                                if wParam in (WM_KEYUP, WM_SYSKEYUP):
                                     return 1
+                                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                                    alt_down  = bool(u32.GetKeyState(VK_MENU)    & 0x8000)
+                                    ctrl_down = bool(u32.GetKeyState(VK_CONTROL) & 0x8000)
+                                    if fs_mod == "alt":
+                                        match = wParam == WM_SYSKEYDOWN and alt_down
+                                    elif fs_mod == "ctrl":
+                                        match = wParam == WM_KEYDOWN and ctrl_down
+                                    else:   # no modifier (e.g. F15)
+                                        match = wParam == WM_KEYDOWN
+                                    if match:
+                                        log(f"  fullscreen key DOWN ({_cfg.fullscreen_key}) → queue 2")
+                                        try:
+                                            _q.put_nowait(2)
+                                        except queue.Full:
+                                            pass
+                                        return 1
 
                     return u32.CallNextHookEx(None, nCode, wParam, lParam)
 

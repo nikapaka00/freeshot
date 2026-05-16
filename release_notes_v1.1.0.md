@@ -39,7 +39,7 @@ All drawing tools (arrow, line, rect, pen, highlighter, text, blur, eraser) now 
 
 | File | SHA-256 |
 |------|---------|
-| FreeShot.exe | c632c175aaf92c8fb6831455b1651d5f8d3dca1ad5f2b21e1cb9110b8861ed08 |
-| FreeShot_debug.exe | 2cc1649d28656b99776fa1a7c59a8a2598c829047a032f34c083d281225d77e7 |
+| FreeShot.exe | d4dc61ce14f9116884f5f6fd0b3f916aa272f77548686baabd2854c48133810b |
+| FreeShot_debug.exe | fecf3303353f44811b0e21aebdb979a4ddb4db2c5fd963a6bc95fbd45f9b7a76 |
 
 Both EXEs are Authenticode-signed. See the README for verification instructions.
