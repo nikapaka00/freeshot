@@ -309,8 +309,26 @@ class SelectionOverlay:
         self.win.bind("<R>",  lambda _: self._set_mode(self.RECT))
         self.win.bind("<f>",  lambda _: self._set_mode(self.FREE))
         self.win.bind("<F>",  lambda _: self._set_mode(self.FREE))
+        self.win.update()           # ensure window is fully mapped before grabbing focus
         self.win.lift()
         self.win.focus_force()
+        # AttachThreadInput workaround — Windows often blocks SetForegroundWindow
+        # for background processes (e.g. tray apps). This sequence always works.
+        try:
+            _u32   = ctypes.windll.user32
+            _hwnd  = self.win.winfo_id()
+            _fg    = _u32.GetForegroundWindow()
+            _fg_tid = _u32.GetWindowThreadProcessId(_fg, None)
+            _our_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            if _fg_tid and _fg_tid != _our_tid:
+                _u32.AttachThreadInput(_fg_tid, _our_tid, True)
+                _u32.SetForegroundWindow(_hwnd)
+                _u32.AttachThreadInput(_fg_tid, _our_tid, False)
+            else:
+                _u32.SetForegroundWindow(_hwnd)
+            _u32.SetFocus(_hwnd)
+        except Exception:
+            pass
 
     def _draw_hints(self):
         self.cv.delete("ui")
@@ -1106,57 +1124,110 @@ class FreeShotApp:
         self._settings_win = SettingsWindow(self.root, self.cfg, self._on_settings_change)
 
     def _setup_hotkeys(self):
-        """Register system-wide hotkeys via RegisterHotKey.
-        Unlike WH_KEYBOARD_LL there is no per-keypress Python callback, so the
-        Python GIL is never held across normal typing — no keyboard freeze.
+        """WH_KEYBOARD_LL hook — the only mechanism that reliably intercepts
+        PrtScrn before Windows' own screenshot handler.  Key config is snapshotted
+        at install time so the callback has no dict lookups; it restarts via
+        _update_hotkeys() whenever the user changes the key settings.
         Queue values: 1 = selection capture, 2 = fullscreen capture."""
-        _q   = self._capture_q
-        _cfg = self.cfg
+        _q = self._capture_q
+
+        # Snapshot config now — no live reads inside the hot-path callback
+        cap_vk   = _CAPTURE_KEYS.get(self.cfg.capture_key, 0x2C)
+        fs_entry = _FULLSCREEN_KEYS.get(self.cfg.fullscreen_key)
+        fs_mod   = fs_entry[0] if fs_entry else None
+        fs_vk    = fs_entry[1] if fs_entry else None
 
         def _thread():
             try:
                 import ctypes as ct
                 import ctypes.wintypes as wt
 
-                WM_HOTKEY = 0x0312
-                u32       = ct.windll.user32
-                u32.GetMessageW.argtypes = [ct.c_void_p, ct.c_void_p,
-                                            ct.c_uint, ct.c_uint]
+                WH_KEYBOARD_LL = 13
+                VK_CONTROL     = 0x11
+                LLKHF_KEYUP    = 0x80   # KBDLLHOOKSTRUCT.flags bit — key released
+                LLKHF_ALTDOWN  = 0x20   # KBDLLHOOKSTRUCT.flags bit — Alt held
 
-                # Store thread-id so _update_hotkeys can send WM_QUIT
+                HOOKPROC = ct.WINFUNCTYPE(ct.c_longlong, ct.c_int,
+                                          wt.WPARAM, wt.LPARAM)
+
+                u32 = ct.windll.user32
+                u32.SetWindowsHookExW.restype   = ct.c_void_p
+                u32.SetWindowsHookExW.argtypes  = [ct.c_int, ct.c_void_p,
+                                                   ct.c_void_p, ct.c_uint]
+                u32.CallNextHookEx.restype      = ct.c_longlong
+                u32.UnhookWindowsHookEx.restype = ct.c_bool
+                u32.GetMessageW.argtypes        = [ct.c_void_p, ct.c_void_p,
+                                                   ct.c_uint, ct.c_uint]
+                u32.GetKeyState.restype         = ct.c_short
+
+                @HOOKPROC
+                def _proc(nCode, wParam, lParam):
+                    if nCode >= 0 and lParam:
+                        try:
+                            # Read vkCode (offset 0) and flags (offset 8) from
+                            # KBDLLHOOKSTRUCT in one pair of cheap memory reads.
+                            vk    = ct.c_uint32.from_address(lParam    ).value
+                            flags = ct.c_uint32.from_address(lParam + 8).value
+                        except (ValueError, OSError):
+                            return u32.CallNextHookEx(None, nCode, wParam, lParam)
+
+                        is_up    = bool(flags & LLKHF_KEYUP)
+                        alt_down = bool(flags & LLKHF_ALTDOWN)
+
+                        # ── Capture key ─────────────────────────────────────
+                        if vk == cap_vk:
+                            if is_up:
+                                return 1   # always swallow KEYUP to avoid orphaned events
+                            if not alt_down:
+                                # Check for Ctrl+same_key → fullscreen
+                                if (fs_mod == "ctrl" and fs_vk == cap_vk and
+                                        bool(u32.GetKeyState(VK_CONTROL) & 0x8000)):
+                                    try:    _q.put_nowait(2)
+                                    except: pass
+                                else:
+                                    try:    _q.put_nowait(1)
+                                    except: pass
+                                return 1
+                            # Alt is held — check fullscreen key
+                            if fs_mod == "alt" and fs_vk == cap_vk:
+                                try:    _q.put_nowait(2)
+                                except: pass
+                                return 1
+
+                        # ── Fullscreen key on a different VK (e.g. F15) ────
+                        elif fs_vk is not None and vk == fs_vk:
+                            if is_up:
+                                return 1
+                            trigger = False
+                            if fs_mod == "alt"  and alt_down:
+                                trigger = True
+                            elif fs_mod == "ctrl" and bool(
+                                    u32.GetKeyState(VK_CONTROL) & 0x8000):
+                                trigger = True
+                            elif fs_mod is None and not alt_down:
+                                trigger = True
+                            if trigger:
+                                try:    _q.put_nowait(2)
+                                except: pass
+                                return 1
+
+                    return u32.CallNextHookEx(None, nCode, wParam, lParam)
+
                 self._hotkey_tid = ct.windll.kernel32.GetCurrentThreadId()
+                hhook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, _proc, None, 0)
+                if not hhook:
+                    return
 
-                cap_vk   = _CAPTURE_KEYS.get(_cfg.capture_key, 0x2C)
-                fs_entry = _FULLSCREEN_KEYS.get(_cfg.fullscreen_key)
-
-                registered = []
-                if u32.RegisterHotKey(None, 1, _MOD_NOREPEAT, cap_vk):
-                    registered.append(1)
-                else:
-                    print(f"[FreeShot] RegisterHotKey(capture) failed "
-                          f"err={ct.windll.kernel32.GetLastError()}", file=sys.stderr)
-
-                if fs_entry is not None:
-                    fs_mod, fs_vk = fs_entry
-                    mod = _FS_MOD_FLAGS.get(fs_mod, _MOD_NOREPEAT)
-                    if u32.RegisterHotKey(None, 2, mod, fs_vk):
-                        registered.append(2)
+                self._hook_proc = _proc   # prevent GC of the callback
 
                 msg = wt.MSG()
-                while u32.GetMessageW(ct.byref(msg), None, 0, 0) != 0:
-                    if msg.message == WM_HOTKEY:
-                        try:
-                            if msg.wParam == 1:
-                                _q.put_nowait(1)
-                            elif msg.wParam == 2:
-                                _q.put_nowait(2)
-                        except queue.Full:
-                            pass
+                while u32.GetMessageW(ct.byref(msg), None, 0, 0) > 0:
+                    u32.TranslateMessage(ct.byref(msg))
+                    u32.DispatchMessageW(ct.byref(msg))
 
-                for hid in registered:
-                    u32.UnregisterHotKey(None, hid)
+                u32.UnhookWindowsHookEx(hhook)
             except Exception as e:
-                print(f"[FreeShot] hotkey thread: {e}", file=sys.stderr)
+                print(f"[FreeShot] hotkey: {e}", file=sys.stderr)
             finally:
                 self._hotkey_tid = 0
 
