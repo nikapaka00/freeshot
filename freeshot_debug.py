@@ -217,6 +217,7 @@ def _write_startup(enable: bool) -> bool:
 
 
 _SAVE_EXTS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
+_SSAA = 2   # supersampling scale — draw at 2× then downscale for smooth edges
 
 
 def _load_font(size: int):
@@ -457,9 +458,12 @@ class SelectionOverlay:
         self.ann_h = y1 - y0
 
         base = region.convert("RGBA") if region.mode != "RGBA" else region.copy()
-        self.ann_base    = base
-        self.ann_current = base.copy()
-        self.ann_history = [base.copy()]
+        # Upscale to 2× for supersampled drawing; output downscales back to 1×
+        base_ss = base.resize(
+            (self.ann_w * _SSAA, self.ann_h * _SSAA), Image.LANCZOS)
+        self.ann_base    = base_ss
+        self.ann_current = base_ss.copy()
+        self.ann_history = [base_ss.copy()]
 
         self.ann_tool      = None
         self.ann_color     = "#ff0000"
@@ -609,6 +613,8 @@ class SelectionOverlay:
 
     def _ann_refresh(self, tmp=None):
         img = (tmp or self.ann_current)
+        # Downscale 2× supersampled canvas to screen resolution for display
+        img = img.resize((self.ann_w, self.ann_h), Image.LANCZOS)
         bg  = self._ann_dark_patch.copy()
         if img.mode == "RGBA":
             bg.paste(img, (0, 0), img.split()[3])
@@ -661,16 +667,20 @@ class SelectionOverlay:
             # O(1): draw only the last segment directly on ann_current
             if len(self.ann_pts) >= 2:
                 ImageDraw.Draw(self.ann_current).line(
-                    self.ann_pts[-2:], fill=self.ann_color,
-                    width=self.ann_thickness, joint="curve")
+                    [(int(px * _SSAA), int(py * _SSAA))
+                     for px, py in self.ann_pts[-2:]],
+                    fill=self.ann_color,
+                    width=self.ann_thickness * _SSAA, joint="curve")
             self._ann_refresh()
         elif self.ann_tool == "eraser":
             # O(1): erase only at the current point
             r = max(6, self.ann_thickness * 4)
             bx0 = max(0, x - r); by0 = max(0, y - r)
             bx1 = min(self.ann_w, x + r); by1 = min(self.ann_h, y + r)
+            s = _SSAA
             self.ann_current.paste(
-                self.ann_base.crop((bx0, by0, bx1, by1)), (bx0, by0))
+                self.ann_base.crop((bx0*s, by0*s, bx1*s, by1*s)),
+                (bx0 * s, by0 * s))
             self._ann_refresh()
 
     def _ann_release(self, e):
@@ -716,49 +726,54 @@ class SelectionOverlay:
     # ── Drawing tools ─────────────────────────────────────────────────────────
 
     def _ann_draw_shape(self, d: ImageDraw.ImageDraw, cx, cy):
-        c, w = self.ann_color, self.ann_thickness
+        c, w = self.ann_color, self.ann_thickness * _SSAA
+        s = _SSAA
+        sx, sy   = int(self.ann_sx * s), int(self.ann_sy * s)
+        cx2, cy2 = int(cx * s), int(cy * s)
         if self.ann_tool == "arrow":
             if self.ann_sx == cx and self.ann_sy == cy:
                 return
-            d.line([(self.ann_sx, self.ann_sy), (cx, cy)], fill=c, width=w)
+            d.line([(sx, sy), (cx2, cy2)], fill=c, width=w)
             ang = math.atan2(cy - self.ann_sy, cx - self.ann_sx)
-            hs  = max(12, w * 5)
+            hs  = max(12 * s, w * 5)
             for da in (0.42, -0.42):
-                ax = cx + hs * math.cos(ang + math.pi + da)
-                ay = cy + hs * math.sin(ang + math.pi + da)
-                d.line([(cx, cy), (int(ax), int(ay))], fill=c, width=w)
+                ax = cx2 + hs * math.cos(ang + math.pi + da)
+                ay = cy2 + hs * math.sin(ang + math.pi + da)
+                d.line([(cx2, cy2), (int(ax), int(ay))], fill=c, width=w)
         elif self.ann_tool == "line":
-            d.line([(self.ann_sx, self.ann_sy), (cx, cy)], fill=c, width=w)
+            d.line([(sx, sy), (cx2, cy2)], fill=c, width=w)
         elif self.ann_tool == "rect":
-            x0, y0 = min(self.ann_sx, cx), min(self.ann_sy, cy)
-            x1, y1 = max(self.ann_sx, cx), max(self.ann_sy, cy)
+            x0, y0 = min(sx, cx2), min(sy, cy2)
+            x1, y1 = max(sx, cx2), max(sy, cy2)
             d.rectangle([x0, y0, x1, y1], outline=c, width=w)
         elif self.ann_tool == "blur":
             # Live preview: cyan outline of the area to be blurred
-            x0, y0 = min(self.ann_sx, cx), min(self.ann_sy, cy)
-            x1, y1 = max(self.ann_sx, cx), max(self.ann_sy, cy)
-            d.rectangle([x0, y0, x1, y1], outline="#00BFFF", width=2)
+            x0, y0 = min(sx, cx2), min(sy, cy2)
+            x1, y1 = max(sx, cx2), max(sy, cy2)
+            d.rectangle([x0, y0, x1, y1], outline="#00BFFF", width=2 * s)
 
     def _ann_draw_stroke(self, img: Image.Image):
         if len(self.ann_pts) < 2:
             return
-        d = ImageDraw.Draw(img)
+        d    = ImageDraw.Draw(img)
+        pts2 = [(int(px * _SSAA), int(py * _SSAA)) for px, py in self.ann_pts]
         if self.ann_tool == "pen":
-            d.line(self.ann_pts, fill=self.ann_color,
-                   width=self.ann_thickness, joint="curve")
+            d.line(pts2, fill=self.ann_color,
+                   width=self.ann_thickness * _SSAA, joint="curve")
         elif self.ann_tool == "hl":
-            d.line(self.ann_pts,
+            d.line(pts2,
                    fill=hex_rgba(self.ann_color, 90),
-                   width=max(14, self.ann_thickness * 7))
+                   width=max(14 * _SSAA, self.ann_thickness * 7 * _SSAA))
 
     def _ann_commit_highlight(self):
         if len(self.ann_pts) < 2:
             return
-        ov = Image.new("RGBA", self.ann_current.size, (0, 0, 0, 0))
+        ov   = Image.new("RGBA", self.ann_current.size, (0, 0, 0, 0))
+        pts2 = [(int(px * _SSAA), int(py * _SSAA)) for px, py in self.ann_pts]
         ImageDraw.Draw(ov).line(
-            self.ann_pts,
+            pts2,
             fill=hex_rgba(self.ann_color, 90),
-            width=max(14, self.ann_thickness * 7))
+            width=max(14 * _SSAA, self.ann_thickness * 7 * _SSAA))
         self.ann_current = Image.alpha_composite(
             self.ann_current.convert("RGBA"), ov)
 
@@ -767,9 +782,10 @@ class SelectionOverlay:
         x1, y1 = max(self.ann_sx, cx), max(self.ann_sy, cy)
         if x1 - x0 < 2 or y1 - y0 < 2:
             return
-        patch = self.ann_current.crop((x0, y0, x1, y1))
+        s = _SSAA
+        patch = self.ann_current.crop((x0*s, y0*s, x1*s, y1*s))
         self.ann_current.paste(
-            patch.filter(ImageFilter.GaussianBlur(radius=10)), (x0, y0))
+            patch.filter(ImageFilter.GaussianBlur(radius=10 * s)), (x0*s, y0*s))
         log(f"  blur applied  region=({x0},{y0})-({x1},{y1})")
 
     def _ann_place_text(self, x, y):
@@ -791,8 +807,8 @@ class SelectionOverlay:
             txt = e.get().strip()
             if txt:
                 d = ImageDraw.Draw(self.ann_current)
-                fnt = _load_font(fs)
-                d.text((x, y), txt, fill=self.ann_color, font=fnt)
+                fnt = _load_font(fs * _SSAA)
+                d.text((int(x * _SSAA), int(y * _SSAA)), txt, fill=self.ann_color, font=fnt)
                 self.ann_history.append(self.ann_current.copy())
                 if len(self.ann_history) > 10:        # fix: apply cap
                     self.ann_history.pop(0)
@@ -814,10 +830,11 @@ class SelectionOverlay:
 
     def _ann_copy(self):
         log("  ann_copy")
-        copy_to_clipboard(self.ann_current)
+        final = self.ann_current.resize((self.ann_w, self.ann_h), Image.LANCZOS)
+        copy_to_clipboard(final)
         if self.cfg.auto_save:
             try:
-                save_png(self.ann_current, self.cfg.save_folder)
+                save_png(final, self.cfg.save_folder)
             except Exception as e:
                 log(f"  ann_copy: auto-save failed: {e}")
                 messagebox.showerror(
@@ -841,7 +858,7 @@ class SelectionOverlay:
         if ext not in _SAVE_EXTS:               # user typed unknown extension
             path += ".png"
             fmt   = "PNG"
-        img = self.ann_current
+        img = self.ann_current.resize((self.ann_w, self.ann_h), Image.LANCZOS)
         if fmt == "JPEG" and img.mode == "RGBA":
             img = img.convert("RGB")
         try:
