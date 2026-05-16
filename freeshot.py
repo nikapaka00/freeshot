@@ -1179,81 +1179,85 @@ class FreeShotApp:
 
                 @HOOKPROC
                 def _proc(nCode, wParam, lParam):
-                    if nCode >= 0 and lParam:
-                        try:
+                    # Outer try/except: any Python exception must never
+                    # prevent CallNextHookEx — that would block the key
+                    # system-wide until LowLevelHooksTimeout fires.
+                    try:
+                        if nCode >= 0 and lParam:
                             # Read vkCode (offset 0) and flags (offset 8) from
                             # KBDLLHOOKSTRUCT in one pair of cheap memory reads.
                             vk    = ct.c_uint32.from_address(lParam    ).value
                             flags = ct.c_uint32.from_address(lParam + 8).value
-                        except (ValueError, OSError):
-                            return u32.CallNextHookEx(None, nCode, wParam, lParam)
+                            is_up    = bool(flags & LLKHF_KEYUP)
+                            alt_down = bool(flags & LLKHF_ALTDOWN)
 
-                        is_up    = bool(flags & LLKHF_KEYUP)
-                        alt_down = bool(flags & LLKHF_ALTDOWN)
-
-                        # ── Capture key ─────────────────────────────────────
-                        if vk == cap_vk:
-                            if is_up:
-                                return 1   # always swallow KEYUP to avoid orphaned events
-                            if not alt_down:
-                                # Check for Ctrl+same_key → fullscreen
-                                if (fs_mod == "ctrl" and fs_vk == cap_vk and
-                                        bool(u32.GetKeyState(VK_CONTROL) & 0x8000)):
-                                    try:    _q.put_nowait(2)
-                                    except: pass
-                                else:
-                                    try:    _q.put_nowait(1)
-                                    except: pass
-                                return 1
-                            # Alt is held — check fullscreen key
-                            if fs_mod == "alt" and fs_vk == cap_vk:
-                                try:    _q.put_nowait(2)
-                                except: pass
+                            # ── KEYUP for any previously-intercepted VK ─────
+                            # Checked first so capture-key / overlay-shortcut
+                            # KEYUPs are only swallowed when we swallowed the
+                            # matching KEYDOWN — avoids orphaned-KEYUP state.
+                            if is_up and vk in _intercepted:
+                                _intercepted.discard(vk)
                                 return 1
 
-                        # ── Fullscreen key on a different VK (e.g. F15) ────
-                        elif fs_vk is not None and vk == fs_vk:
-                            if is_up:
-                                return 1
-                            trigger = False
-                            if fs_mod == "alt"  and alt_down:
-                                trigger = True
-                            elif fs_mod == "ctrl" and bool(
-                                    u32.GetKeyState(VK_CONTROL) & 0x8000):
-                                trigger = True
-                            elif fs_mod is None and not alt_down:
-                                trigger = True
-                            if trigger:
-                                try:    _q.put_nowait(2)
-                                except: pass
-                                return 1
+                            if not is_up:
+                                # ── Capture key (plain, no modifier) ────────
+                                if vk == cap_vk:
+                                    if not alt_down:
+                                        # Ctrl+same_key → fullscreen
+                                        if (fs_mod == "ctrl" and fs_vk == cap_vk
+                                                and bool(u32.GetKeyState(
+                                                    VK_CONTROL) & 0x8000)):
+                                            try:    _q.put_nowait(2)
+                                            except: pass
+                                        else:
+                                            try:    _q.put_nowait(1)
+                                            except: pass
+                                        _intercepted.add(vk)
+                                        return 1
+                                    # Alt held — only intercept if FS == alt+same
+                                    if fs_mod == "alt" and fs_vk == cap_vk:
+                                        try:    _q.put_nowait(2)
+                                        except: pass
+                                        _intercepted.add(vk)
+                                        return 1
 
-                        # ── Overlay keyboard shortcuts ───────────────────────
-                        # Route Escape / R / F to the overlay via the queue.
-                        # Works regardless of OS keyboard focus.
-                        # _intercepted tracks VKs whose KEYDOWN was swallowed so
-                        # their KEYUP is also swallowed — avoids orphaned KEYUP
-                        # events that corrupt other apps' keyboard state.
-                        if is_up and vk in _intercepted:
-                            _intercepted.discard(vk)
-                            return 1
-                        if not is_up and _app._overlay_ref is not None:
-                            if vk == 0x1B:        # VK_ESCAPE — cancel overlay
-                                _intercepted.add(vk)
-                                try:    _q.put_nowait(3)
-                                except: pass
-                                return 1
-                            elif vk == 0x52:      # VK_R — rectangle mode
-                                _intercepted.add(vk)
-                                try:    _q.put_nowait(4)
-                                except: pass
-                                return 1
-                            elif vk == 0x46:      # VK_F — freehand mode
-                                _intercepted.add(vk)
-                                try:    _q.put_nowait(5)
-                                except: pass
-                                return 1
+                                # ── Fullscreen key on a different VK (F15…) ─
+                                elif fs_vk is not None and vk == fs_vk:
+                                    trigger = False
+                                    if fs_mod == "alt"  and alt_down:
+                                        trigger = True
+                                    elif fs_mod == "ctrl" and bool(
+                                            u32.GetKeyState(VK_CONTROL) & 0x8000):
+                                        trigger = True
+                                    elif fs_mod is None  and not alt_down:
+                                        trigger = True
+                                    if trigger:
+                                        try:    _q.put_nowait(2)
+                                        except: pass
+                                        _intercepted.add(vk)
+                                        return 1
 
+                                # ── Overlay shortcuts (Esc / R / F) ─────────
+                                # Only reached when overlay is open AND the key
+                                # isn't the capture/fullscreen key.
+                                elif _app._overlay_ref is not None:
+                                    if vk == 0x1B:      # VK_ESCAPE — cancel
+                                        _intercepted.add(vk)
+                                        try:    _q.put_nowait(3)
+                                        except: pass
+                                        return 1
+                                    elif vk == 0x52:    # VK_R — rectangle mode
+                                        _intercepted.add(vk)
+                                        try:    _q.put_nowait(4)
+                                        except: pass
+                                        return 1
+                                    elif vk == 0x46:    # VK_F — freehand mode
+                                        _intercepted.add(vk)
+                                        try:    _q.put_nowait(5)
+                                        except: pass
+                                        return 1
+                    except Exception:
+                        pass
                     return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
                 self._hotkey_tid = ct.windll.kernel32.GetCurrentThreadId()
