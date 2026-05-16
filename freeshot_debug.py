@@ -223,6 +223,26 @@ def _write_startup(enable: bool) -> bool:
         return False
 
 
+# ── Window-focus helpers ─────────────────────────────────────────────────────
+_GWL_EXSTYLE      = -20
+_WS_EX_NOACTIVATE = 0x08000000
+_WS_EX_TOOLWINDOW = 0x00000080
+
+def _set_window_noactivate(hwnd: int, enable: bool) -> None:
+    """Toggle WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW on a window."""
+    try:
+        u32 = ctypes.windll.user32
+        ex  = u32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+        if enable:
+            ex |= (_WS_EX_NOACTIVATE | _WS_EX_TOOLWINDOW)
+        else:
+            ex &= ~_WS_EX_NOACTIVATE
+        u32.SetWindowLongW(hwnd, _GWL_EXSTYLE, ex)
+        log(f"  WS_EX_NOACTIVATE {'set' if enable else 'cleared'} on hwnd={hwnd}")
+    except Exception as e:
+        log(f"  _set_window_noactivate FAILED: {e!r}")
+
+
 _SAVE_EXTS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
 _SSAA = 2   # supersampling scale — draw at 2× then downscale for smooth edges
 
@@ -323,6 +343,8 @@ class SelectionOverlay:
         except Exception as _e:
             self._prev_fg = 0
             log(f"  _prev_fg capture failed: {_e}")
+        # Re-enable activation so SetForegroundWindow / SetFocus can grab focus
+        _set_window_noactivate(self.win.winfo_id(), False)
         self.win.deiconify()
         log("  deiconify()")
 
@@ -499,6 +521,17 @@ class SelectionOverlay:
         for w in self.win.winfo_children():
             w.destroy()
         self.win.withdraw()
+        # Re-mark hidden root as non-activatable so it stops capturing keys
+        _set_window_noactivate(self.win.winfo_id(), True)
+        # Hand keyboard focus back to whatever window had it before us
+        try:
+            u32 = ctypes.windll.user32
+            if self._prev_fg and u32.IsWindow(self._prev_fg) \
+                    and self._prev_fg != self.win.winfo_id():
+                u32.SetForegroundWindow(self._prev_fg)
+                log(f"  focus restored to hwnd={self._prev_fg:#x}")
+        except Exception as e:
+            log(f"  focus restore failed: {e!r}")
         self.shot = self._dark = self._ph_dark = None
         for attr in ("ann_base", "ann_current", "ann_history",
                      "_ann_dark_patch", "_ann_ph"):
@@ -1134,10 +1167,35 @@ class FreeShotApp:
             except Exception as e:
                 log(f"  DPI awareness failed: {e}")
 
+        # Capture whichever window had keyboard focus when we launched —
+        # we hand focus back to it after we create our (hidden) Tk root.
+        try:
+            _prev_fg = ctypes.windll.user32.GetForegroundWindow()
+            log(f"  initial foreground hwnd={_prev_fg:#x}")
+        except Exception as _e:
+            _prev_fg = 0
+            log(f"  initial foreground capture failed: {_e}")
+
         self.cfg  = Config()
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.withdraw()
+
+        # Mark the hidden root WS_EX_NOACTIVATE so it can never grab
+        # keyboard focus (the overlay re-enables activation when shown).
+        _set_window_noactivate(self.root.winfo_id(), True)
+
+        # Hand focus back to the user's app — if we stole it during tk.Tk()
+        # the user's typing would otherwise go to our hidden window.
+        try:
+            u32 = ctypes.windll.user32
+            if _prev_fg and u32.IsWindow(_prev_fg) and \
+                    _prev_fg != self.root.winfo_id():
+                u32.SetForegroundWindow(_prev_fg)
+                log(f"  initial focus restored to hwnd={_prev_fg:#x}")
+        except Exception as _e:
+            log(f"  initial focus restore failed: {_e!r}")
+
         self._active      = False
         self._overlay_ref = None                   # live reference to the open SelectionOverlay
         self._capture_q   = queue.Queue(maxsize=1) # bounded: drop if a capture is already pending
