@@ -315,6 +315,14 @@ class SelectionOverlay:
         self.win.geometry(f"{self.sw}x{self.sh}+0+0")
         log(f"  geometry set to {self.sw}x{self.sh}+0+0")
         self.win.attributes("-topmost", True)
+        # Snapshot the foreground window before showing the overlay — used to
+        # restore keyboard focus when the overlay closes.
+        try:
+            self._prev_fg = ctypes.windll.user32.GetForegroundWindow()
+            log(f"  _prev_fg={self._prev_fg:#x}")
+        except Exception as _e:
+            self._prev_fg = 0
+            log(f"  _prev_fg capture failed: {_e}")
         self.win.deiconify()
         log("  deiconify()")
 
@@ -490,6 +498,17 @@ class SelectionOverlay:
         log("SelectionOverlay._close_overlay")
         for w in self.win.winfo_children():
             w.destroy()
+        # Return keyboard focus to the app that was foreground before the overlay.
+        # Must happen BEFORE withdraw — we still hold foreground at this point.
+        try:
+            prev = getattr(self, '_prev_fg', 0)
+            if prev and ctypes.windll.user32.IsWindow(prev):
+                ok = ctypes.windll.user32.SetForegroundWindow(prev)
+                log(f"  SetForegroundWindow(_prev_fg={prev:#x}) → {ok}")
+            else:
+                log(f"  _prev_fg={prev:#x} invalid or zero — skipping restore")
+        except Exception as _e:
+            log(f"  focus restore EXCEPTION: {_e}")
         self.win.withdraw()
         self.shot = self._dark = self._ph_dark = None
         for attr in ("ann_base", "ann_current", "ann_history",
@@ -1130,8 +1149,9 @@ class FreeShotApp:
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.withdraw()
-        self._active    = False
-        self._capture_q = queue.Queue(maxsize=1)   # bounded: drop if a capture is already pending
+        self._active      = False
+        self._overlay_ref = None                   # live reference to the open SelectionOverlay
+        self._capture_q   = queue.Queue(maxsize=1) # bounded: drop if a capture is already pending
 
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
@@ -1158,6 +1178,18 @@ class FreeShotApp:
                 if val == 2:
                     log("  capture queue → _trigger_fullscreen")
                     self._trigger_fullscreen()
+                elif val == 3:
+                    log("  capture queue → overlay cancel (Escape from hook)")
+                    ov = self._overlay_ref
+                    if ov: ov._cancel()
+                elif val == 4:
+                    log("  capture queue → overlay rect mode (R from hook)")
+                    ov = self._overlay_ref
+                    if ov: ov._set_mode(ov.RECT)
+                elif val == 5:
+                    log("  capture queue → overlay free mode (F from hook)")
+                    ov = self._overlay_ref
+                    if ov: ov._set_mode(ov.FREE)
                 else:
                     log("  capture queue → _trigger")
                     self._trigger()
@@ -1247,6 +1279,7 @@ class FreeShotApp:
         fs_entry = _FULLSCREEN_KEYS.get(self.cfg.fullscreen_key)
         fs_mod   = fs_entry[0] if fs_entry else None
         fs_vk    = fs_entry[1] if fs_entry else None
+        _app     = self   # reference for overlay key routing
         log(f"  _setup_hotkeys  cap_vk={cap_vk:#x}  fs_mod={fs_mod}  fs_vk={fs_vk!r}")
 
         def _thread():
@@ -1328,6 +1361,29 @@ class FreeShotApp:
                                 except: pass
                                 return 1
 
+                        # ── Overlay keyboard shortcuts ───────────────────────
+                        # Route Escape / R / F to the overlay via the queue.
+                        # This works even if the overlay window doesn't have
+                        # OS keyboard focus (common on Windows 11 tray apps).
+                        if not is_up:
+                            _ov = _app._overlay_ref
+                            if _ov is not None:
+                                if vk == 0x1B:        # VK_ESCAPE — cancel overlay
+                                    log(f"  hook → overlay Escape (vk=0x1b)")
+                                    try:    _q.put_nowait(3)
+                                    except: pass
+                                    return 1
+                                elif vk == 0x52:      # VK_R — rectangle mode
+                                    log(f"  hook → overlay R (rect mode)")
+                                    try:    _q.put_nowait(4)
+                                    except: pass
+                                    return 1
+                                elif vk == 0x46:      # VK_F — freehand mode
+                                    log(f"  hook → overlay F (free mode)")
+                                    try:    _q.put_nowait(5)
+                                    except: pass
+                                    return 1
+
                     return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
                 self._hotkey_tid = ct.windll.kernel32.GetCurrentThreadId()
@@ -1390,7 +1446,7 @@ class FreeShotApp:
             if shot.size != (lw, lh):
                 log(f"  resizing {shot.size} → {lw}x{lh}  (DPI awareness fallback)")
                 shot = shot.resize((lw, lh), Image.LANCZOS)
-            SelectionOverlay(self.root, shot, self._on_done, self.cfg)
+            self._overlay_ref = SelectionOverlay(self.root, shot, self._on_done, self.cfg)
         except Exception:
             # Always release the lock so subsequent hotkey presses still work
             self._active = False
@@ -1426,6 +1482,7 @@ class FreeShotApp:
 
     def _on_done(self):
         log("  _on_capture_done")
+        self._overlay_ref = None
         self._active = False
         self.root.withdraw()
 
